@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -28,7 +30,14 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent
 DOCS_MD = PLUGIN_ROOT / "docs" / "md"
 DOCS_STRUCTURED = PLUGIN_ROOT / "docs" / "structured"
 
+# Make win_bridge importable when we run on Windows natively
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 mcp = FastMCP("electra-one")
+
+
+def _is_windows() -> bool:
+    return sys.platform == "win32"
 
 
 # ---------- MIDI helpers (mido + python-rtmidi, no external binary) ----------
@@ -71,6 +80,100 @@ _MIDI_BACKEND_HINT = (
 )
 
 
+# ---------- WSL → Windows-side MIDI bridge ----------
+#
+# On WSL there's typically no /dev/snd/seq, so python-rtmidi cannot reach the
+# device. The plugin ships a tiny Windows-side script (win_bridge.py) that
+# talks to winmm.dll via ctypes and needs no pip deps on the Windows side.
+# When we detect WSL, we stage the bridge under %TEMP% and shell out to
+# `python.exe win_bridge.py …`.
+
+def _is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        with open("/proc/version", "r", encoding="utf-8") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
+_BRIDGE_SRC = PLUGIN_ROOT / "server" / "win_bridge.py"
+
+
+def _windows_temp_dir() -> Path | None:
+    """Return the WSL-side path to %TEMP%, or None if we can't resolve it."""
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", "echo $env:TEMP"],
+            capture_output=True, text=True, timeout=10,
+        )
+        win_temp = out.stdout.strip().replace("\r", "")
+        if not win_temp:
+            return None
+        wsl_temp = subprocess.run(
+            ["wslpath", "-u", win_temp],
+            capture_output=True, text=True, timeout=5,
+        )
+        path = Path(wsl_temp.stdout.strip())
+        return path if path.exists() else None
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return None
+
+
+def _stage_bridge() -> tuple[Path, str] | None:
+    """Copy win_bridge.py into %TEMP%\\electra-one-mcp\\ and return (wsl_path, win_path)."""
+    win_tmp = _windows_temp_dir()
+    if win_tmp is None or not _BRIDGE_SRC.exists():
+        return None
+    staged_dir = win_tmp / "electra-one-mcp"
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    staged = staged_dir / "win_bridge.py"
+    if not staged.exists() or staged.read_bytes() != _BRIDGE_SRC.read_bytes():
+        shutil.copy2(_BRIDGE_SRC, staged)
+    try:
+        win_path = subprocess.run(
+            ["wslpath", "-w", str(staged)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, FileNotFoundError):
+        return None
+    return staged, win_path
+
+
+def _run_bridge(args: list[str]) -> dict[str, Any]:
+    """Invoke win_bridge.py via python.exe on the Windows host and parse its JSON."""
+    staged = _stage_bridge()
+    if staged is None:
+        return {"ok": False, "error": "could not stage win_bridge.py to %TEMP% (not WSL?)"}
+    _, win_path = staged
+    cmd = ["powershell.exe", "-NoProfile", "-Command", f"python '{win_path}' " + " ".join(args)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "win_bridge timed out"}
+    stdout = result.stdout.strip()
+    try:
+        return json.loads(stdout.splitlines()[-1]) if stdout else {"ok": False, "error": "no output from bridge"}
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "non-JSON output from bridge", "stdout": stdout, "stderr": result.stderr}
+
+
+def _send_via_windows(sysex_payload: bytes, port_name: str) -> dict[str, Any]:
+    """Write the SysEx blob to a Windows-reachable temp file, then ask win_bridge to send it."""
+    win_tmp = _windows_temp_dir()
+    if win_tmp is None:
+        return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+    payload_path = win_tmp / "electra-one-mcp" / "payload.bin"
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_path.write_bytes(sysex_payload)
+    win_payload = subprocess.run(
+        ["wslpath", "-w", str(payload_path)],
+        capture_output=True, text=True, timeout=5,
+    ).stdout.strip()
+    return _run_bridge(["send", "--port", f'"{port_name}"', "--payload", f'"{win_payload}"'])
+
+
 # ---------- tools ----------
 
 @mcp.tool()
@@ -78,24 +181,61 @@ def push_to_device(preset_path: str, port: str | None = None) -> dict[str, Any]:
     """Upload a preset JSON to the Electra One's currently selected slot via USB SysEx.
 
     Sends `F0 00 21 45 01 01 <preset-json-bytes> F7` directly through the OS
-    MIDI stack (mido + python-rtmidi). No external binary required.
+    MIDI stack. On native Linux/macOS/Windows this uses mido + python-rtmidi.
+    On WSL it routes through a tiny Windows-side helper (win_bridge.py) that
+    talks to winmm.dll via ctypes — no usbipd-win setup required as long as
+    the device is connected to the Windows host.
+
+    The preset upload SysEx must reach the CTRL port, which on Windows surfaces
+    as `MIDIOUT3 (Electra Controller)`. We auto-target that name in WSL mode.
 
     Args:
         preset_path: Filesystem path to the preset.json (or demo.preset.json).
         port: Optional MIDI output port name; auto-detected (matches "electra") if omitted.
     """
-    m = _get_mido()
-    if m is None:
-        return {"ok": False, "error": "install python-mido and python-rtmidi: pip install mido python-rtmidi"}
-
     p = Path(preset_path)
     if not p.exists():
         return {"ok": False, "error": f"preset not found: {preset_path}"}
 
     preset_json = p.read_text(encoding="utf-8")
     minified = json.dumps(json.loads(preset_json), separators=(",", ":"))
-    # SysEx data: mido frames with F0/F7 around `data`
-    payload = [0x00, 0x21, 0x45, 0x01, 0x01] + list(minified.encode("utf-8"))
+    payload_data = [0x00, 0x21, 0x45, 0x01, 0x01] + list(minified.encode("utf-8"))
+
+    sysex_blob = bytes([0xF0] + payload_data + [0xF7])
+
+    # Windows-native path: call win_bridge functions directly (in-process, no IPC)
+    if _is_windows():
+        import win_bridge
+        target = port or "MIDIOUT3 (Electra Controller)"
+        # Write to a temp file and call send_sysex (it reads from disk)
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
+            f.write(sysex_blob)
+            tmp = f.name
+        try:
+            result = win_bridge.send_sysex(target, tmp, chunk_size=32768)
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        result.setdefault("via", "windows winmm (in-process)")
+        result["bytes_sent"] = len(sysex_blob)
+        return result
+
+    # WSL path: shell out to win_bridge on Windows
+    if _is_wsl():
+        target = port or "MIDIOUT3 (Electra Controller)"
+        result = _send_via_windows(sysex_blob, target)
+        result.setdefault("via", "wsl→windows winmm")
+        result.setdefault("port", target)
+        result["bytes_sent"] = len(sysex_blob)
+        return result
+
+    # Native path (Linux/macOS/Windows): mido + python-rtmidi
+    m = _get_mido()
+    if m is None:
+        return {"ok": False, "error": "install python-mido and python-rtmidi: pip install mido python-rtmidi"}
 
     target = port or _find_electra_port("output")
     if not target:
@@ -107,11 +247,11 @@ def push_to_device(preset_path: str, port: str | None = None) -> dict[str, Any]:
 
     try:
         with m.open_output(target) as out:
-            out.send(m.Message("sysex", data=payload))
+            out.send(m.Message("sysex", data=payload_data))
     except Exception as e:
         return {"ok": False, "error": f"send failed: {e}"}
 
-    return {"ok": True, "port": target, "bytes_sent": len(payload) + 2}
+    return {"ok": True, "port": target, "bytes_sent": len(payload_data) + 2}
 
 
 @mcp.tool()
