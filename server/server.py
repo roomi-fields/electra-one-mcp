@@ -1,18 +1,17 @@
 """MCP server for the Electra One plugin.
 
-Exposes nine tools that combine USB SysEx push (via sendmidi), MIDI log
-capture, doc search, validation, bundling, and emulator screenshots.
+Exposes nine tools that combine USB SysEx push (via mido + python-rtmidi),
+MIDI log capture, doc search, validation, bundling, and emulator screenshots.
 
-Run with:  python -m mcp_electra_one  (after installing the `mcp` package)
+Run with:  python server/server.py  (after `pip install mcp mido python-rtmidi`)
 """
 
 from __future__ import annotations
 
 import json
 import os
-import shutil
-import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,29 +31,44 @@ DOCS_STRUCTURED = PLUGIN_ROOT / "docs" / "structured"
 mcp = FastMCP("electra-one")
 
 
-# ---------- helpers ----------
+# ---------- MIDI helpers (mido + python-rtmidi, no external binary) ----------
 
-def _find_sendmidi() -> str | None:
-    return shutil.which("sendmidi")
+def _get_mido():
+    """Lazy-import mido so the rest of the server works without it."""
+    try:
+        import mido as _m
+        # Pin the rtmidi backend explicitly; mido's auto-detection sometimes
+        # falls back to a stub that silently returns no ports.
+        _m.set_backend("mido.backends.rtmidi")
+        return _m
+    except ImportError:
+        return None
+    except Exception:
+        # Backend loaded but ALSA/CoreMIDI/WinMM unavailable. Return the module
+        # anyway; the caller surfaces the runtime error on get_*_names().
+        import mido as _m
+        return _m
 
 
-def _detect_electra_port() -> str | None:
-    """Use `sendmidi list` to find a port whose name contains 'electra'."""
-    sm = _find_sendmidi()
-    if not sm:
+def _find_electra_port(direction: str = "output") -> str | None:
+    m = _get_mido()
+    if m is None:
         return None
     try:
-        out = subprocess.check_output([sm, "list"], text=True, timeout=5)
+        ports = m.get_output_names() if direction == "output" else m.get_input_names()
     except Exception:
         return None
-    for line in out.splitlines():
-        if "electra" in line.lower():
-            return line.strip().split(":", 1)[-1].strip() or line.strip()
+    for p in ports:
+        if "electra" in p.lower():
+            return p
     return None
 
 
-def _bytes_to_sendmidi_args(payload: bytes) -> list[str]:
-    return [f"{b:02X}" for b in payload]
+_MIDI_BACKEND_HINT = (
+    "MIDI backend (rtmidi) failed to enumerate ports. On WSL this usually "
+    "means /dev/snd/seq is missing — forward the device with usbipd-win and "
+    "make sure ALSA is set up (the same mechanism osc-bridge uses)."
+)
 
 
 # ---------- tools ----------
@@ -63,17 +77,16 @@ def _bytes_to_sendmidi_args(payload: bytes) -> list[str]:
 def push_to_device(preset_path: str, port: str | None = None) -> dict[str, Any]:
     """Upload a preset JSON to the Electra One's currently selected slot via USB SysEx.
 
-    The preset is sent as `F0 00 21 45 01 01 <preset-json-bytes> F7`
-    (see docs/midiimplementation.md "Upload Preset"). Requires `sendmidi`
-    on the PATH (https://github.com/gbevin/SendMIDI).
+    Sends `F0 00 21 45 01 01 <preset-json-bytes> F7` directly through the OS
+    MIDI stack (mido + python-rtmidi). No external binary required.
 
     Args:
         preset_path: Filesystem path to the preset.json (or demo.preset.json).
-        port: Optional MIDI port name; auto-detected from `sendmidi list` if omitted.
+        port: Optional MIDI output port name; auto-detected (matches "electra") if omitted.
     """
-    sm = _find_sendmidi()
-    if not sm:
-        return {"ok": False, "error": "sendmidi not found on PATH"}
+    m = _get_mido()
+    if m is None:
+        return {"ok": False, "error": "install python-mido and python-rtmidi: pip install mido python-rtmidi"}
 
     p = Path(preset_path)
     if not p.exists():
@@ -81,27 +94,24 @@ def push_to_device(preset_path: str, port: str | None = None) -> dict[str, Any]:
 
     preset_json = p.read_text(encoding="utf-8")
     minified = json.dumps(json.loads(preset_json), separators=(",", ":"))
+    # SysEx data: mido frames with F0/F7 around `data`
+    payload = [0x00, 0x21, 0x45, 0x01, 0x01] + list(minified.encode("utf-8"))
 
-    header = bytes([0x00, 0x21, 0x45, 0x01, 0x01])
-    payload = header + minified.encode("utf-8")
+    target = port or _find_electra_port("output")
+    if not target:
+        try:
+            available = m.get_output_names()
+        except Exception as e:
+            return {"ok": False, "error": _MIDI_BACKEND_HINT + f"  raw error: {e}"}
+        return {"ok": False, "error": "no Electra MIDI port found", "available_ports": available}
 
-    use_port = port or _detect_electra_port()
-    if not use_port:
-        return {"ok": False, "error": "no Electra port detected; pass `port` explicitly"}
-
-    cmd = [sm, "dev", use_port, "syx"] + _bytes_to_sendmidi_args(payload)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "sendmidi timed out"}
+        with m.open_output(target) as out:
+            out.send(m.Message("sysex", data=payload))
+    except Exception as e:
+        return {"ok": False, "error": f"send failed: {e}"}
 
-    return {
-        "ok": result.returncode == 0,
-        "port": use_port,
-        "bytes_sent": len(payload) + 2,  # plus F0 / F7 sendmidi adds
-        "stdout": result.stdout,
-        "stderr": result.stderr,
-    }
+    return {"ok": True, "port": target, "bytes_sent": len(payload) + 2}
 
 
 @mcp.tool()
@@ -109,80 +119,100 @@ def get_device_logs(seconds: float = 5.0, port: str | None = None) -> dict[str, 
     """Listen on the CTRL port for `lua:` log messages from the device.
 
     Captures the device's print() output and fatal-error stack traces for the
-    given number of seconds.
+    given number of seconds. Uses mido + python-rtmidi.
 
     Args:
         seconds: How long to listen (default 5).
-        port: Optional CTRL-port name; auto-detected if omitted.
+        port: Optional MIDI input port name; auto-detected (matches "electra") if omitted.
     """
-    rm = shutil.which("receivemidi")
-    if not rm:
-        return {
-            "ok": False,
-            "error": "receivemidi not found; install from https://github.com/gbevin/ReceiveMIDI",
-        }
-    use_port = port or _detect_electra_port()
-    if not use_port:
-        return {"ok": False, "error": "no Electra port detected"}
-    try:
-        result = subprocess.run(
-            [rm, "dev", use_port, "syx", "timeout", str(int(seconds))],
-            capture_output=True,
-            text=True,
-            timeout=seconds + 5,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "receivemidi timed out"}
+    m = _get_mido()
+    if m is None:
+        return {"ok": False, "error": "install python-mido and python-rtmidi: pip install mido python-rtmidi"}
 
-    # SysEx → look for "lua: …" payload by decoding bytes after the header
-    lines = []
-    for raw in result.stdout.splitlines():
-        if not raw.startswith("syx"):
-            continue
-        # raw looks like: "syx hex hex hex …"
-        hex_bytes = raw.split()[1:]
-        data = bytes(int(h, 16) for h in hex_bytes)
-        text = data.decode("utf-8", errors="ignore")
-        # The "lua:" prefix is in the payload
-        if "lua:" in text:
-            idx = text.index("lua:")
-            lines.append(text[idx:].strip("\x00\x01\x02\x03\x04\xF7"))
-        else:
-            lines.append(text)
-    return {"ok": True, "port": use_port, "lines": lines}
+    target = port or _find_electra_port("input")
+    if not target:
+        try:
+            available = m.get_input_names()
+        except Exception as e:
+            return {"ok": False, "error": _MIDI_BACKEND_HINT + f"  raw error: {e}"}
+        return {"ok": False, "error": "no Electra MIDI input port found", "available_ports": available}
+
+    lines: list[str] = []
+    end = time.monotonic() + float(seconds)
+    try:
+        with m.open_input(target) as inp:
+            while time.monotonic() < end:
+                msg = inp.poll()
+                if msg is None:
+                    time.sleep(0.005)
+                    continue
+                if msg.type != "sysex":
+                    continue
+                data = bytes(msg.data)
+                text = data.decode("utf-8", errors="ignore").strip("\x00\x01\x02\x03\x04")
+                if "lua:" in text:
+                    idx = text.index("lua:")
+                    text = text[idx:]
+                lines.append(text)
+    except Exception as e:
+        return {"ok": False, "error": f"listen failed: {e}"}
+
+    return {"ok": True, "port": target, "seconds": seconds, "lines": lines}
 
 
 @mcp.tool()
 def device_status(port: str | None = None) -> dict[str, Any]:
     """Query the device's firmware version, current preset, and MIDI port.
 
-    Sends a `request electra info` SysEx and parses the response.
+    Sends a `request electra info` SysEx and listens briefly for the reply
+    (`F0 00 21 45 02 7F F7` → device responds with info SysEx).
     """
-    sm = _find_sendmidi()
-    rm = shutil.which("receivemidi")
-    if not sm:
-        return {"ok": False, "error": "sendmidi not on PATH"}
-    if not rm:
-        return {"ok": False, "error": "receivemidi not on PATH"}
-    use_port = port or _detect_electra_port()
-    if not use_port:
-        return {"ok": False, "error": "no Electra port detected"}
-    # SysEx "request electra info": 0xF0 0x00 0x21 0x45 0x02 0x7F 0xF7
-    cmd = [sm, "dev", use_port, "syx", "00", "21", "45", "02", "7F"]
+    m = _get_mido()
+    if m is None:
+        return {"ok": False, "error": "install python-mido and python-rtmidi"}
+
+    out_port = port or _find_electra_port("output")
+    in_port = port or _find_electra_port("input")
+    if not out_port or not in_port:
+        try:
+            outs = m.get_output_names()
+            ins = m.get_input_names()
+        except Exception as e:
+            return {"ok": False, "error": _MIDI_BACKEND_HINT + f"  raw error: {e}"}
+        return {"ok": False, "error": "no Electra port found", "outputs": outs, "inputs": ins}
+
+    request = [0x00, 0x21, 0x45, 0x02, 0x7F]
+    reply_bytes: list[int] = []
     try:
-        subprocess.run(cmd, check=True, timeout=5)
+        with m.open_input(in_port) as inp, m.open_output(out_port) as outp:
+            outp.send(m.Message("sysex", data=request))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                msg = inp.poll()
+                if msg and msg.type == "sysex":
+                    reply_bytes = list(msg.data)
+                    break
+                time.sleep(0.005)
     except Exception as e:
-        return {"ok": False, "error": f"sendmidi failed: {e}"}
-    # Listen for response briefly
+        return {"ok": False, "error": f"status query failed: {e}"}
+
+    if not reply_bytes:
+        return {"ok": False, "error": "device did not respond within 2 s"}
+
+    # Reply payload starts with 00 21 45 02 7F then a JSON or text string.
+    # Strip the manufacturer/header prefix if present and try to decode as text.
+    body = bytes(reply_bytes)
+    for prefix in (bytes([0x00, 0x21, 0x45, 0x02, 0x7F]), bytes([0x00, 0x21, 0x45])):
+        if body.startswith(prefix):
+            body = body[len(prefix):]
+            break
+    text = body.decode("utf-8", errors="replace").strip("\x00\x01\x02\x03")
+    info: Any = text
     try:
-        out = subprocess.check_output(
-            [rm, "dev", use_port, "syx", "timeout", "2"],
-            text=True,
-            timeout=4,
-        )
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "device did not respond"}
-    return {"ok": True, "port": use_port, "raw": out.strip()}
+        info = json.loads(text)
+    except Exception:
+        pass
+    return {"ok": True, "port_in": in_port, "port_out": out_port, "info": info}
 
 
 @mcp.tool()

@@ -28,17 +28,37 @@ tools, and make sure `sendmidi` is on your PATH (see "Prerequisites").
 
 ## Prerequisites
 
-- **Python ≥ 3.10** with the MCP SDK: `pip install mcp` (use a venv or `--break-system-packages` on Debian/Ubuntu systems with PEP 668).
-- **`sendmidi`** and **`receivemidi`** (https://github.com/gbevin/SendMIDI) for the device push + log tools — `brew install sendmidi` on macOS, prebuilt binaries for Windows/Linux on the GitHub releases page.
-- **Node ≥ 18** if you want to use the bundler / screenshot tools (optional).
+- **Python ≥ 3.10** with the MCP SDK and MIDI deps:
+
+  ```bash
+  pip install -r requirements.txt
+  # or:
+  pip install mcp mido python-rtmidi
+  ```
+
+  On Debian/Ubuntu hosts that enforce PEP 668, use a venv or
+  `pip install --break-system-packages …`.
+
+- **A working MIDI backend** for python-rtmidi:
+  - **macOS** — CoreMIDI works out of the box, nothing to install.
+  - **Linux native** — ALSA is already there; the device is auto-detected.
+  - **WSL2** — same setup you'd use for `osc-bridge`: forward the USB
+    device with [`usbipd-win`](https://github.com/dorssel/usbipd-win)
+    (`usbipd attach --wsl --busid <n>`), and confirm `/dev/snd/seq`
+    exists in your WSL distro. If `osc-bridge list` shows the device,
+    so will this MCP.
+  - **Windows native** — WinMM works out of the box.
+
+- **Node ≥ 18** if you want to use the bundler / screenshot tools
+  (optional, only for the `screenshot_widget` tool).
 
 ## MCP tools exposed
 
 | Tool | What it does |
 |---|---|
-| `electra.push_to_device(preset_path)` | Encode the preset JSON as SysEx and send it to the active slot over USB MIDI. No browser, no clicks. |
-| `electra.get_device_logs(seconds)` | Listen on the CTRL port for `lua:` log messages from the device — print() output and fatal-error stack traces. |
-| `electra.device_status()` | Query firmware version, current preset name/slot, and connected MIDI port. |
+| `electra.push_to_device(preset_path)` | Encode the preset JSON as SysEx and send it to the active slot over USB MIDI **directly via mido + python-rtmidi** (no external binary). No browser, no clicks. |
+| `electra.get_device_logs(seconds)` | Listen on the CTRL port for `lua:` log messages from the device — print() output and fatal-error stack traces. Uses mido. |
+| `electra.device_status()` | Query firmware version, current preset name/slot, and connected MIDI port via SysEx info request. Uses mido. |
 | `electra.search_docs(query, kind)` | Full-text search of the mirrored documentation. `kind` filters by section (api / luacourse / troubleshooting / userguide). |
 | `electra.get_api(symbol)` | Return the documented signature + parameters + example for a specific Lua API symbol (`graphics.print`, `parameterMap.onChange`, etc.). |
 | `electra.list_constants(category)` | List enum constants by category — touch events (DOWN/MOVE/UP/CLICK/DOUBLECLICK), controller events, MIDI message types, alignments, models. |
