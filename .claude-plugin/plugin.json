@@ -1,6 +1,6 @@
 {
   "name": "electra-one",
-  "description": "Develop Electra One MK2/Mini widgets and presets from Claude Code. Push to device over USB SysEx (sendmidi), capture Lua logs, search the indexed official documentation, validate preset JSON, all without leaving the chat.",
+  "description": "Develop Electra One MK2/Mini widgets and presets from Claude Code. Push presets to device over USB SysEx (mido + python-rtmidi), capture Lua logs, search the indexed official documentation, validate preset JSON, all without leaving the chat.",
   "version": "0.1.0",
   "author": {
     "name": "roomi-fields",
@@ -9,9 +9,7 @@
   "homepage": "https://github.com/roomi-fields/electra-one-mcp",
   "repository": "https://github.com/roomi-fields/electra-one-mcp",
   "license": "MIT",
-  "skills": [
-    "skills/dev-electra-one/SKILL.md"
-  ],
+  "keywords": ["electra-one", "midi", "sysex", "lua", "widget", "preset", "music", "hardware"],
   "mcpServers": {
     "electra-one": {
       "command": "python3",

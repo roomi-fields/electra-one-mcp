@@ -1,10 +1,12 @@
 ---
 name: dev-electra-one
 description: |
-  Use this skill BEFORE writing or modifying any Lua/preset code targeting an Electra One MIDI controller (MK2/Mini), or pushing a preset via Firestore PATCH. Activate whenever the user mentions Electra One, MK2, electraone-widgets, a .lua file under `widgets/`, `lib/theme.lua`, the preset JSON, `app.electra.one`, `setPaintCallback`, `setTouchCallback`, `setPotCallback`, or anything about pushing/uploading widgets to the device. Reading the project's `HOWTO.md` is mandatory before touching code — multiple sessions have re-paid hours of debug time rediscovering things already documented (graphics.print not drawText, 0xRRGGBB colours, WIDTH/HEIGHT constants, integer-coord requirement, etc.).
-author: Romi (claude@liance.art)
-version: 1.0.0
-date: 2026-05-25
+  Use this skill BEFORE writing or modifying any Lua/preset code targeting an Electra One MIDI controller (MK2/Mini), or pushing a preset via Firestore PATCH. Activate whenever the user mentions Electra One, MK2, electraone-widgets, a .lua file under widgets/, lib/theme.lua, the preset JSON, app.electra.one, setPaintCallback, setTouchCallback, setPotCallback, or anything about pushing/uploading widgets to the device. Reading the project's HOWTO.md is mandatory before touching code — multiple sessions have re-paid hours of debug time rediscovering things already documented (graphics.print not drawText, 0xRRGGBB colours, WIDTH/HEIGHT constants, integer-coord requirement, etc.).
+license: MIT
+metadata:
+  author: roomi-fields
+  version: 1.0.0
+  source: https://github.com/roomi-fields/electra-one-mcp
 ---
 
 # dev-electra-one
