@@ -12,19 +12,24 @@ The Electra One Lua extension is powerful but its documentation is split across 
 
 ## Install
 
-```bash
-claude plugin install gh:roomi-fields/electra-one-mcp
+Inside a Claude Code session:
+
+```
+/plugin marketplace add roomi-fields/claude-plugins
+/plugin install electra-one@roomi-fields
 ```
 
-After install:
-- Activate the skill: it'll trigger automatically whenever you work on Electra One Lua/preset code.
-- Restart Claude Code so the MCP server is registered.
-- Plug your Electra One in via USB and ensure `sendmidi` is on your PATH (see "Prerequisites" below).
+Then restart Claude Code so the MCP server is registered. The skill
+activates automatically as soon as you touch any Electra One Lua / preset
+code; the MCP tools become available under the `electra-one` namespace.
+
+Plug your Electra One in via USB before using the push / log / status
+tools, and make sure `sendmidi` is on your PATH (see "Prerequisites").
 
 ## Prerequisites
 
-- **Python ≥ 3.10** for the MCP server.
-- **`sendmidi`** (https://github.com/gbevin/SendMIDI) for the device push tool — `brew install sendmidi` on macOS, prebuilt binaries for Windows/Linux on the GitHub releases page.
+- **Python ≥ 3.10** with the MCP SDK: `pip install mcp` (use a venv or `--break-system-packages` on Debian/Ubuntu systems with PEP 668).
+- **`sendmidi`** and **`receivemidi`** (https://github.com/gbevin/SendMIDI) for the device push + log tools — `brew install sendmidi` on macOS, prebuilt binaries for Windows/Linux on the GitHub releases page.
 - **Node ≥ 18** if you want to use the bundler / screenshot tools (optional).
 
 ## MCP tools exposed
@@ -45,13 +50,13 @@ After install:
 
 ```
 electra-one-mcp/
-├── plugin.json
+├── .claude-plugin/plugin.json       # Claude Code manifest
 ├── skills/
 │   └── dev-electra-one/SKILL.md     # always-on Claude skill
-├── mcp/
-│   ├── __main__.py                  # `python -m mcp_electra_one`
-│   ├── server.py                    # MCP server using the official `mcp` SDK
-│   └── tools/                       # one file per tool
+├── server/
+│   ├── __init__.py
+│   ├── __main__.py                  # python -m server (rarely used directly)
+│   └── server.py                    # MCP server using the official `mcp` SDK
 ├── docs/
 │   ├── md/                          # raw markdown mirror of docs.electra.one (79 pages)
 │   └── structured/
