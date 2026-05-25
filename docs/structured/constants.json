@@ -1,0 +1,131 @@
+{
+  "hardware_ports": [
+    "PORT_1",
+    "PORT_2",
+    "PORT_CTRL"
+  ],
+  "interfaces": [
+    "MIDI_IO",
+    "USB_DEV",
+    "USB_HOST"
+  ],
+  "change_origins": [
+    "INTERNAL",
+    "MIDI",
+    "LUA"
+  ],
+  "parameter_types": [
+    "PT_VIRTUAL",
+    "PT_CC7",
+    "PT_CC14",
+    "PT_NRPN",
+    "PT_RPN",
+    "PT_NOTE",
+    "PT_PROGRAM",
+    "PT_SYSEX",
+    "PT_START",
+    "PT_STOP",
+    "PT_TUNE",
+    "PT_ATPOLY",
+    "PT_ATCHANNEL",
+    "PT_PITCHBEND",
+    "PT_SPP",
+    "PT_RELCC",
+    "PT_NONE"
+  ],
+  "control_sets": [
+    "CONTROL_SET_1",
+    "CONTROL_SET_2",
+    "CONTROL_SET_3"
+  ],
+  "pots": [
+    "POT_1",
+    "POT_2",
+    "POT_3",
+    "POT_4",
+    "POT_5",
+    "POT_6",
+    "POT_7",
+    "POT_8",
+    "POT_9",
+    "POT_10",
+    "POT_11",
+    "POT_12"
+  ],
+  "colors": [
+    "WHITE",
+    "RED",
+    "ORANGE",
+    "BLUE",
+    "GREEN",
+    "PURPLE"
+  ],
+  "variants": [
+    "VT_DEFAULT",
+    "VT_HIGHLIGHTED",
+    "VT_THIN",
+    "VT_VALUEONLY",
+    "VT_DIAL",
+    "VT_CHECKBOX"
+  ],
+  "bounding_box": [
+    "X",
+    "Y",
+    "WIDTH",
+    "HEIGHT"
+  ],
+  "midi": [
+    "CONTROL_CHANGE",
+    "NOTE_ON",
+    "NOTE_OFF",
+    "PROGRAM_CHANGE",
+    "POLY_PRESSURE",
+    "CHANNEL_PRESSURE",
+    "PITCH_BEND",
+    "CLOCK",
+    "START",
+    "STOP",
+    "CONTINUE",
+    "ACTIVE_SENSING",
+    "RESET",
+    "SONG_SELECT",
+    "SONG_POSITION",
+    "TUNE_REQUEST",
+    "TIME_CODE_QUARTER_FRAME",
+    "SYSEX"
+  ],
+  "events": [
+    "NONE",
+    "PAGES",
+    "CONTROL_SETS",
+    "USB_HOST_PORT",
+    "POTS",
+    "TOUCH",
+    "BUTTONS",
+    "WINDOWS"
+  ],
+  "touch": [
+    "DOWN",
+    "MOVE",
+    "UP",
+    "CLICK",
+    "DOUBLECLICK"
+  ],
+  "curve": [
+    "TOP_LEFT",
+    "TOP_RIGHT",
+    "BOTTOM_LEFT",
+    "BOTTOM_RIGHT"
+  ],
+  "model": [
+    "MODEL_ANY",
+    "MODEL_MK1",
+    "MODEL_MK2",
+    "MODEL_MINI_MK1"
+  ],
+  "align": [
+    "LEFT",
+    "CENTER",
+    "RIGHT"
+  ]
+}

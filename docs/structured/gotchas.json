@@ -1,0 +1,163 @@
+{
+  "_meta": {
+    "description": "Device-side quirks confirmed empirically on Electra One MK2 firmware 4.1.4 (verified 2026-05-25). These are NOT in the official docs, or contradict them in subtle ways. Patterns flagged here usually cause silent failures (widget renders as blue-bar fallback, callbacks not firing, MIDI traffic missing) with no error message.",
+    "verified_firmware": "4.1.4",
+    "verified_date": "2026-05-25"
+  },
+  "gotchas": [
+    {
+      "id": "drawText-does-not-exist",
+      "category": "graphics",
+      "severity": "fatal",
+      "title": "graphics.drawText is not a real API",
+      "symptom": "Widget renders as a default blue fader on device with no error in the browser console.",
+      "cause": "graphics.drawText() raises 'attempt to call a nil value (field drawText)' at the first paint. Only graphics.print(x, y, text, width, alignment) exists.",
+      "fix": "Replace every drawText call with graphics.print(x, y, text, 9999, LEFT) (or pass a real width + CENTER/RIGHT alignment).",
+      "doc_ref": "developers/luaext.md#graphicsprint"
+    },
+    {
+      "id": "integer-coords-required",
+      "category": "graphics",
+      "severity": "fatal",
+      "title": "Graphics calls require integer coordinates",
+      "symptom": "Paint aborts midway with 'bad argument #N to fillRect (number has no integer representation)'.",
+      "cause": "Any expression with a `/N` division (or implicit float) produces a float; graphics.fillRect / drawRect / drawLine / print / fillCircle reject non-integer coords.",
+      "fix": "Wrap every coord in math.floor(...). Theme.rect / outline / line in our shipped theme.lua already do this internally — only direct graphics.* calls need it."
+    },
+    {
+      "id": "rgb888-not-rgb565",
+      "category": "graphics",
+      "severity": "wrong-colors",
+      "title": "Pass 0xRRGGBB colours (24-bit), the firmware converts to RGB565 itself",
+      "symptom": "Colours render blue/cyan instead of the expected slate/terracotta palette.",
+      "cause": "Pre-converting a 24-bit colour to RGB565 (0x10C3 etc.) makes the firmware re-interpret the 16-bit number as a 24-bit colour, mapping into the lower 16 bits → mostly blue.",
+      "fix": "Keep colours as 0xRRGGBB in the source. The firmware release notes for 4.1.4 specifically fixed this conversion."
+    },
+    {
+      "id": "iife-breaks-upvalues",
+      "category": "bundling",
+      "severity": "fatal",
+      "title": "Theme/primitives wrapped in (function() ... end)() lose their upvalues",
+      "symptom": "Paint/touch/pot callbacks don't fire on device; tile renders as blue-bar fallback. Often a single tile renders OK but a second one doesn't.",
+      "cause": "Closures defined inside an IIFE wrap reference upvalues that the firmware does not preserve after the chunk completes execution. Detected during phase 4-A bundling work.",
+      "fix": "Flat concatenation. theme.lua uses `Theme = Theme or {}` (not local Theme = {}), strip the trailing `return Theme`, primitives rewrite `local function NAME(...)` → `function Theme.NAME(...)`. See scripts/bundle-preset.js."
+    },
+    {
+      "id": "local-graphics-upvalue",
+      "category": "bundling",
+      "severity": "fatal",
+      "title": "`local g = graphics` at module top level breaks paint dispatch",
+      "symptom": "Custom tile renders as blue-bar fallback despite the bundle parsing fine.",
+      "cause": "Caching the graphics table as an upvalue creates a closure binding that the firmware drops after the chunk loads.",
+      "fix": "Reference `graphics` directly inside every helper. Never cache it."
+    },
+    {
+      "id": "callbacks-must-be-globals",
+      "category": "lua-runtime",
+      "severity": "fatal",
+      "title": "setPaintCallback / setTouchCallback / setPotCallback need global functions, not closures",
+      "symptom": "Widget renders once (the initial paint) but no further repaints; touches/pot rotations produce nothing.",
+      "cause": "Passing a local closure with upvalues to setPaintCallback causes the firmware to lose the binding after the load chunk returns.",
+      "fix": "Declare paintLane / touchLane / potLane as top-level globals. Keep per-tile state in global tables indexed by ctrl:getId()."
+    },
+    {
+      "id": "one-pot-per-custom-tile",
+      "category": "pots",
+      "severity": "feature-gap",
+      "title": "Only one pot is dispatched to a custom tile, regardless of how many `inputs` entries you declare",
+      "symptom": "You declare 2 inputs in the JSON expecting 2 pots, but only 1 pot triggers the setPotCallback AND produces USB MIDI traffic; the other declared pots are silent on both channels.",
+      "cause": "The `inputs[]` array is honoured for ADSR/fader/etc., but the firmware ignores it for type:'custom' tiles. See forum thread #4172 — Martin Pavlas confirmed multi-input custom is a planned feature, not shipped.",
+      "fix": "Plan UX around 1 pot per custom tile. Use single-click toggles + double-click for secondary actions, plus touchscreen tap/drag for navigation/editing.",
+      "verified": "rev 142, 145, 147 of widgets/note-list-16/ on firmware 4.1.4"
+    },
+    {
+      "id": "no-encoder-press-detection",
+      "category": "pots",
+      "severity": "feature-gap",
+      "title": "Press on a pot is not distinguishable from rotation start",
+      "symptom": "Tracking a 'click without rotation' is unreliable — the user has to be very gentle to avoid an accidental tiny delta.",
+      "cause": "events.onPotTouchChange fires on capacitive touch but doesn't distinguish press from turn. No onPotClick exists. Forums #4116 and #4185 confirm.",
+      "fix": "Track a `rotatedDuringTouch` flag (set true on MOVE, reset on DOWN), treat UP-without-MOVE as click. Use the touchscreen for clear DOUBLECLICK gestures instead — those ARE dispatched as a native event type."
+    },
+    {
+      "id": "ev-id-zero-indexed",
+      "category": "pots",
+      "severity": "off-by-one",
+      "title": "ev.id in setPotCallback is 0-indexed (0..11), even though the doc says potId 1..12",
+      "symptom": "Filter `ev.id ~= 1` never matches when the user turns the top-left pot.",
+      "cause": "The doc (presetformat.md) consistently calls them 'potId 1..12', but the Lua callback receives 0..11.",
+      "fix": "Use 0..11 in your filter logic. If you map JSON inputs (1..12) to Lua filters, subtract 1."
+    },
+    {
+      "id": "cross-dispatch-pot-routing",
+      "category": "pots",
+      "severity": "ux-quirk",
+      "title": "The pot dispatched to a custom tile is on the OPPOSITE physical row",
+      "symptom": "User expects 'top pot controls top tile' but the top pot triggers the bottom tile and vice versa.",
+      "cause": "Empirical observation on firmware 4.1.4: tile in slotId 0 (top half of screen) receives ev.id=6 (= leftmost pot of the BOTTOM physical row). Tile in slotId 6 receives ev.id=0 (= leftmost pot of the TOP physical row).",
+      "fix": "Cross-dispatch in your potCallback: when sourceCtrl:getId()==1, operate on lanes[2]; when ==2, operate on lanes[1]. See widgets/note-list-16/widget.lua."
+    },
+    {
+      "id": "slotid-zero-indexed",
+      "category": "preset-json",
+      "severity": "off-by-one",
+      "title": "slotId is 0-indexed (0..35 on the MK2 6×6 grid)",
+      "symptom": "Tile appears one column to the right of where you expected.",
+      "cause": "slotId=0 is top-left, slotId=5 is top-right of row 1, slotId=6 is the leftmost slot of row 2, etc.",
+      "fix": "Use 0..35 for MK2 6×6 layout. Note that `slotId` is not documented in presetformat.md — the canonical positioning field is `bounds: [x, y, w, h]`. slotId is an editor convenience that may be silently ignored on certain firmware paths."
+    },
+    {
+      "id": "span6-unreliable-second-tile",
+      "category": "preset-json",
+      "severity": "layout-bug",
+      "title": "`span: \"6\"` reliably enlarges only the FIRST custom tile; the second is rendered as a single slot",
+      "symptom": "Two custom tiles each declaring span:6 — the first fills its row, the second is 146×56 in the middle of the second row.",
+      "cause": "Empirical (firmware 4.1.4). Workaround pattern needed.",
+      "fix": "Call ctrl:setBounds({0, y, w, h}) explicitly for every tile in preset.onLoad, instead of relying on span/vspan. The Lua setBounds is honoured for the visual paint area."
+    },
+    {
+      "id": "setbounds-vs-slotid-routing",
+      "category": "touch-routing",
+      "severity": "fatal",
+      "title": "Touch events route by slotId, not by setBounds",
+      "symptom": "Tap on the visible area of a tile selects nothing — hitCell returns nil.",
+      "cause": "If you reposition a tile visually via setBounds (e.g., swap top↔bottom), the firmware still dispatches touches based on the original slotId. event.x/event.y arrive in the original slot's coordinate space, but ctrl:getBounds() returns your overridden bounds — the hit test misses.",
+      "fix": "Pick a slotId that matches the target visual position; only use setBounds to ENLARGE (e.g., make a 1-slot tile cover a full row), not to MOVE."
+    },
+    {
+      "id": "instrumentid-required",
+      "category": "preset-json",
+      "severity": "wont-load",
+      "title": "Device JSON needs `instrumentId: \"generic-controls\"`",
+      "symptom": "The preset uploads but the editor or device fails to recognize the device entry.",
+      "fix": "Always include `instrumentId: \"generic-controls\"` in each entry of devices[]. The default is implicit but explicit is safer."
+    },
+    {
+      "id": "schemav2-vs-v3",
+      "category": "preset-json",
+      "severity": "ui-confusion",
+      "title": "Mixing schemaVersion 2 and 3 in the same preset disables UI controls",
+      "symptom": "The editor shows the preset but the Edit/Upload buttons are missing.",
+      "cause": "The Firestore-doc-level `schemaVersion` field and the project-level `schemaVersion` field must match. A doc-level 3 with a v2-shaped project loses the UI controls.",
+      "fix": "Keep them in sync. The XT envelopes preset is a known-working v2 reference (id GK6wmbgvwM6S3GanpoN7) for custom-tile structure."
+    },
+    {
+      "id": "logger-off-by-default",
+      "category": "debug",
+      "severity": "blind-spot",
+      "title": "The device logger is disabled by default — print() and fatal-error traces are silent until enabled",
+      "symptom": "Nothing appears in the editor's Lua log window when the widget runs.",
+      "cause": "'For performance reasons' per the docs. The 4.1.4 firmware added a fatal-error handler that prints stack traces to the logger — but only if you turn the logger on.",
+      "fix": "In the editor's Lua tab, toggle the logger ON. Once enabled, print() output and fatal-error stack traces flow through."
+    },
+    {
+      "id": "parametermap-onchange-is-global-fn",
+      "category": "lua-runtime",
+      "severity": "api-misuse",
+      "title": "parameterMap.onChange is a global function you DEFINE, not one you call",
+      "symptom": "`attempt to call a nil value (field 'onChange')` at preset.onLoad.",
+      "cause": "Like preset.onLoad / events.onPageChange, the firmware invokes a global function you've declared. There is no parameterMap.onChange(vo, callback) registration API.",
+      "fix": "Declare `function parameterMap.onChange(valueObjects, origin, midiValue) ... end` at module scope. The firmware will invoke it whenever any ParameterMap entry changes."
+    }
+  ]
+}
