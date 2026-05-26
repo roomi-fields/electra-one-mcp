@@ -343,6 +343,47 @@ graph-based widgets) before improvising.
   added fatal-error Lua handler, fixed RGB888→RGB565 translation,
   fixed memory leak in `controls.get()`).
 
+## Pushing presets to a real device via SysEx (Windows USB-MIDI specifics)
+
+These notes apply when the MCP `push_to_device` tool runs against a physical
+Electra One MK2 over USB on a Windows host. Learned the hard way (forum #592
+corroboration + on-hardware testing 2026-05-25/26).
+
+**The simple `01 01` upload command is fragile above ~5 KB on Windows.** The
+USB-MIDI 1.0 class driver fragments large `midiOutLongMsg` calls at the USB
+packet layer, and the device parses only the first fragment as a truncated
+preset. Windows updates KB5077181 / KB5074105 (late 2025) made this worse.
+Don't try to brute-force it by splitting `midiOutLongMsg` calls of the same
+SysEx — each call becomes its own SysEx frame on the wire (own start/end
+markers) and the device sees N small malformed presets, not one big one.
+
+**Use the File Transfer API for any preset > ~5 KB.** Each step is its own
+small complete SysEx so the driver doesn't fragment:
+1. Open cache:    `F0 00 21 45 01 2D F7`
+2. Register file: `F0 00 21 45 01 2E <fileId> <s0> <s1> <s2> <s3> F7` — size split as four 7-bit bytes, LE
+3. Chunks (≤ 1-2 KB ASCII each): `F0 00 21 45 01 2F <fileId> <data> F7`
+4. Commit: `F0 00 21 45 04 2D {"files":[{"id":1,"location":"slots","type":"preset","bankNumber":B,"slot":S,"md5":"<32-hex>"}]} F7` — MD5 over the **decoded** payload (raw JSON), not the SysEx-wrapped bytes.
+5. Include a **Transaction ID** in every step (firmware ≥ 4.0): insert `0x00 <txid-lsb> <txid-msb>` right after the manufacturer id. Without it, ACKs can't be correlated.
+
+**ACK format**: `F0 00 21 45 7E 01 <txid-lsb> <txid-msb> F7` (success); `7E 00 …` for NACK. Check after every command; bail on NACK with a useful error.
+
+**CTRL port on Windows for this hardware**: `MIDIOUT3 (Electra Controller)` ↔ `MIDIIN3 (Electra Controller)`. The bare-named "Electra Controller" is port 1, MIDIOUT2/IN2 is port 2.
+
+**Listening for ACKs (winmm + ctypes) — two non-obvious traps**:
+- **Polling `MHDR_DONE` races the driver write-back** → you read `F0` followed by zeros. Use `CALLBACK_FUNCTION` with `WINFUNCTYPE` so the driver hands you a complete buffer.
+- **`hdr.lpData` as `c_char_p` truncates at the first NUL byte** (Electra SysEx contains `0x00` right after `F0`). Don't read via `lpData`. Keep the Python-side `ctypes.create_string_buffer` allocations in a list, find which one this header refers to via `ctypes.addressof(headers[i]) == ctypes.addressof(hdr)`, and read `buffers[i].raw[:n]`.
+
+**Long-term path** (when Win 10 support can be dropped): port to **Windows MIDI Services 1.0** via `winsdk` / `pywinrt`. Shipped to Win 11 in Feb 2026; replaces `winmm.dll` and fixes the USB-MIDI 1.0 fragmentation issue.
+
+**Reference impl + ongoing state**: `server/win_bridge.py` in [electra-one-mcp](https://github.com/roomi-fields/electra-one-mcp). See `HOWTO.md` section "Pushing presets via SysEx" for the full play-by-play and forum thread #592.
+
+**Empirical limits confirmed on firmware 4.1.4 (2026-05-26)**:
+- < ~5 KB via simple `01 01` upload: works, displays immediately
+- < ~6 KB via FT API: commit succeeds, file persists, displays after reload trigger
+- ≥ ~25 KB via FT API: all chunks ACK'd, commit ACK'd, `7E 05` + `7E 02` events fire, **but `Get Active Preset` (`02 01`) afterwards returns 0 bytes**. The file does not actually land on disk — silent MD5-rollback most likely. Open issue.
+- **`Reload Preset Slot` (`08 08`) returns NACK** in 4.1.4 despite docs listing it as no-args. Either docs are wrong about the args, or the command got renamed.
+- **No SysEx query for "which bank/slot is on screen"**. Maintain client state by passively listening for unsolicited `7E 02 bank slot` (preset switch) and `7E 08 bank` (bank switch) events on the CTRL port.
+
 ## Reflex when something breaks silently on device
 
 - Widget renders as a blue bar / default fader → paint callback raised an

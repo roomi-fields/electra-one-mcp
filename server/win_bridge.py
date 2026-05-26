@@ -204,153 +204,376 @@ def upload_preset_file_transfer(
     bank: int = 0,
     slot: int = 0,
     chunk_bytes: int = 1024,
+    in_port: str | None = None,
+    verify_ack: bool = True,
+    ack_timeout: float = 3.0,
+    use_tx_id: bool = True,
 ) -> dict:
     """Upload a preset using Electra's File Transfer SysEx API.
 
     Each individual SysEx command stays well under the Windows USB-MIDI driver
-    buffer limit, so this works for any preset size. Protocol:
+    buffer limit. With `verify_ack=True` we send each command with a unique
+    transaction id and wait for the device's ACK (or NACK) on the CTRL input
+    port before sending the next command.
 
-      1. Open cache:    F0 00 21 45 01 2D F7
-      2. Register file: F0 00 21 45 01 2E <fid> <s0> <s1> <s2> <s3> F7
-      3. Send chunks:   F0 00 21 45 01 2F <fid> <data 7-bit> F7  (repeated)
-      4. Commit:        F0 00 21 45 04 2D <commit-json> F7
+    Protocol (each command includes a 3-byte txid wrapper: 0x00 <lsb> <msb>):
+      1. Open cache:    F0 00 21 45 00 <tx> <tx> 01 2D F7
+      2. Register file: F0 00 21 45 00 <tx> <tx> 01 2E <fid> <s0..s3> F7
+      3. Send chunks:   F0 00 21 45 00 <tx> <tx> 01 2F <fid> <data> F7
+      4. Commit:        F0 00 21 45 00 <tx> <tx> 04 2D <commit-json> F7
 
-    The preset JSON is plain ASCII so we can use it as raw 7-bit data without
-    re-encoding (every byte is already < 128).
+    ACK format (firmware ≥ 4.0): F0 00 21 45 7E 01 <tx-lsb> <tx-msb> F7
+    NACK: F0 00 21 45 7E 00 <tx-lsb> <tx-msb> F7
     """
-    import hashlib, json as _json
+    import hashlib, json as _json, threading
+
     file_id = 1
     size = len(preset_json_bytes)
     md5 = hashlib.md5(preset_json_bytes).hexdigest()
 
-    def _send_blob(blob: bytes) -> int:
+    if verify_ack and in_port is None:
+        # Default: same port number on the input side
+        in_port = out_port.replace("MIDIOUT", "MIDIIN")
+        if in_port == out_port:  # no rename happened (e.g. "Electra Controller")
+            # use the matching MIDIIN3 default
+            in_port = "MIDIIN3 (Electra Controller)"
+
+    # ---- async listener that captures ACK/NACK and parks them in a dict ----
+    pending: dict[int, dict] = {}      # txid -> {"ok": bool, "raw": bytes}
+    pending_lock = threading.Lock()
+    listener_stop = threading.Event()
+
+    def _ack_listener():
+        ports = list_ports()
+        idx = _resolve_port(in_port, ports["inputs"])
+        if idx is None:
+            return
+
+        CALLBACK_FUNCTION = 0x00030000
+        MIM_LONGDATA = 0x3C4
+        CallbackProto = ctypes.WINFUNCTYPE(None, c_void_p, c_uint, c_void_p, c_void_p, c_void_p)
+        BUF_SIZE = 8192
+        NUM_BUFS = 4
+        headers = [MIDIHDR() for _ in range(NUM_BUFS)]
+        buffers = [ctypes.create_string_buffer(BUF_SIZE) for _ in range(NUM_BUFS)]
+        handle_l = c_void_p()
+
+        def _arm(i):
+            hdr = headers[i]
+            hdr.lpData = ctypes.cast(buffers[i], ctypes.c_char_p)
+            hdr.dwBufferLength = BUF_SIZE
+            hdr.dwBytesRecorded = 0
+            hdr.dwFlags = 0
+            winmm.midiInPrepareHeader(handle_l, byref(hdr), sizeof(hdr))
+            winmm.midiInAddBuffer(handle_l, byref(hdr), sizeof(hdr))
+
+        def _cb(hMidi, wMsg, dwInst, dwP1, dwP2):
+            if wMsg != MIM_LONGDATA or not dwP1:
+                return
+            hdr_ptr = ctypes.cast(dwP1, POINTER(MIDIHDR))
+            hdr = hdr_ptr.contents
+            n = hdr.dwBytesRecorded
+            if n <= 0:
+                return
+            for i in range(NUM_BUFS):
+                if ctypes.addressof(headers[i]) == ctypes.addressof(hdr):
+                    raw = bytes(buffers[i].raw[:n])
+                    _classify_and_park(raw)
+                    winmm.midiInUnprepareHeader(hMidi, hdr_ptr, sizeof(MIDIHDR))
+                    _arm(i)
+                    return
+
+        # Capture EVERY SysEx received for diagnostics, even non-ACK
+        all_received: list[bytes] = []
+
+        def _classify_and_park(raw: bytes):
+            all_received.append(raw)
+            # Expected ACK/NACK: F0 00 21 45 7E <01|00> <lsb> <msb> F7
+            if len(raw) < 9 or raw[0] != 0xF0 or raw[-1] != 0xF7:
+                return
+            if raw[1:5] != bytes([0x00, 0x21, 0x45, 0x7E]):
+                return
+            ok = raw[5] == 0x01
+            txid = raw[6] | (raw[7] << 7)
+            with pending_lock:
+                pending[txid] = {"ok": ok, "raw": raw}
+
+        cb = CallbackProto(_cb)
+        rc = winmm.midiInOpen(byref(handle_l), idx, ctypes.cast(cb, c_void_p), None, CALLBACK_FUNCTION)
+        if rc != 0:
+            return
+        try:
+            for i in range(NUM_BUFS):
+                _arm(i)
+            winmm.midiInStart(handle_l)
+            while not listener_stop.wait(0.02):
+                pass
+            winmm.midiInStop(handle_l)
+            for hdr in headers:
+                winmm.midiInUnprepareHeader(handle_l, byref(hdr), sizeof(hdr))
+        finally:
+            winmm.midiInClose(handle_l)
+
+    listener_thread = None
+    if verify_ack:
+        listener_thread = threading.Thread(target=_ack_listener, daemon=True)
+        listener_thread.start()
+        time.sleep(0.1)  # let the listener arm itself
+
+    # ---- helpers to send + wait ----
+    _next_tx = [0]
+
+    def _alloc_tx() -> int:
+        _next_tx[0] = (_next_tx[0] + 1) & 0x3FFF  # 14-bit (two 7-bit bytes)
+        return _next_tx[0]
+
+    def _wrap_with_tx(cmd_body: bytes, txid: int) -> bytes:
+        if not use_tx_id:
+            # Legacy framing: no tx id
+            return bytes([0xF0, 0x00, 0x21, 0x45]) + cmd_body + bytes([0xF7])
+        lsb = txid & 0x7F
+        msb = (txid >> 7) & 0x7F
+        return (bytes([0xF0, 0x00, 0x21, 0x45, 0x00, lsb, msb])
+                + cmd_body
+                + bytes([0xF7]))
+
+    def _send_and_wait(cmd_body: bytes, step_name: str) -> dict:
+        txid = _alloc_tx()
+        blob = _wrap_with_tx(cmd_body, txid)
         ports = list_ports()
         idx = _resolve_port(out_port, ports["outputs"])
         if idx is None:
-            return -1
+            return {"ok": False, "step": step_name, "error": "out port not found"}
         handle = c_void_p()
         rc = winmm.midiOutOpen(byref(handle), idx, None, None, 0)
         if rc != 0:
-            return rc
+            return {"ok": False, "step": step_name, "rc": rc, "error": "midiOutOpen"}
         try:
-            return _send_one_chunk(handle, blob)
+            rc = _send_one_chunk(handle, blob)
         finally:
             winmm.midiOutClose(handle)
-
-    # 1. open cache
-    open_cache = bytes([0xF0, 0x00, 0x21, 0x45, 0x01, 0x2D, 0xF7])
-    rc = _send_blob(open_cache)
-    if rc != 0:
-        return {"ok": False, "step": "open_cache", "rc": rc}
-    time.sleep(0.05)
-
-    # 2. register file (size as four 7-bit bytes, little-endian)
-    s0 = size & 0x7F
-    s1 = (size >> 7) & 0x7F
-    s2 = (size >> 14) & 0x7F
-    s3 = (size >> 21) & 0x7F
-    register = bytes([0xF0, 0x00, 0x21, 0x45, 0x01, 0x2E, file_id, s0, s1, s2, s3, 0xF7])
-    rc = _send_blob(register)
-    if rc != 0:
-        return {"ok": False, "step": "register", "rc": rc}
-    time.sleep(0.05)
-
-    # 3. send chunks
-    chunks_sent = 0
-    for offset in range(0, size, chunk_bytes):
-        chunk = preset_json_bytes[offset:offset + chunk_bytes]
-        # SysEx data must be 7-bit. Preset JSON is ASCII so already compliant.
-        if any(b >= 0x80 for b in chunk):
-            return {"ok": False, "step": "chunk", "error": "non-ASCII byte in preset"}
-        sysex = bytes([0xF0, 0x00, 0x21, 0x45, 0x01, 0x2F, file_id]) + chunk + bytes([0xF7])
-        rc = _send_blob(sysex)
         if rc != 0:
-            return {"ok": False, "step": "chunk", "chunk_index": chunks_sent, "rc": rc}
-        chunks_sent += 1
-        time.sleep(0.005)
+            return {"ok": False, "step": step_name, "rc": rc, "txid": txid}
 
-    # 4. commit
-    commit = {"files": [{
-        "id": file_id, "location": "slots", "type": "preset",
-        "bankNumber": bank, "slot": slot, "md5": md5,
-    }]}
-    commit_json = _json.dumps(commit, separators=(",", ":")).encode("utf-8")
-    sysex = bytes([0xF0, 0x00, 0x21, 0x45, 0x04, 0x2D]) + commit_json + bytes([0xF7])
-    rc = _send_blob(sysex)
-    if rc != 0:
-        return {"ok": False, "step": "commit", "rc": rc, "commit_size": len(sysex)}
+        if not verify_ack:
+            return {"ok": True, "step": step_name, "txid": txid}
 
-    return {
-        "ok": True, "via": "file-transfer-api",
-        "size": size, "chunks": chunks_sent, "md5": md5,
-        "bank": bank, "slot": slot,
-    }
+        deadline = time.monotonic() + ack_timeout
+        while time.monotonic() < deadline:
+            with pending_lock:
+                if txid in pending:
+                    result = pending.pop(txid)
+                    return {
+                        "ok": result["ok"], "step": step_name, "txid": txid,
+                        "ack_hex": result["raw"].hex(),
+                    }
+            time.sleep(0.01)
+        with pending_lock:
+            other_acks = {k: v["raw"].hex() for k, v in pending.items()}
+        return {
+            "ok": False, "step": step_name, "txid": txid,
+            "error": "ACK timeout",
+            "sent_hex": blob.hex(),
+            "other_acks_received": other_acks,
+        }
+
+    step_log = []
+
+    try:
+        # 1. Open cache
+        r = _send_and_wait(bytes([0x01, 0x2D]), "open_cache")
+        step_log.append(r)
+        if not r["ok"]:
+            return r
+
+        # 2. Register file (size as four 7-bit, LE)
+        s0 = size & 0x7F
+        s1 = (size >> 7) & 0x7F
+        s2 = (size >> 14) & 0x7F
+        s3 = (size >> 21) & 0x7F
+        r = _send_and_wait(
+            bytes([0x01, 0x2E, file_id, s0, s1, s2, s3]),
+            "register",
+        )
+        step_log.append(r)
+        if not r["ok"]:
+            return r
+
+        # 3. Send chunks
+        chunks_sent = 0
+        for offset in range(0, size, chunk_bytes):
+            chunk = preset_json_bytes[offset:offset + chunk_bytes]
+            if any(b >= 0x80 for b in chunk):
+                return {"ok": False, "step": "chunk", "error": "non-7bit byte"}
+            cmd = bytes([0x01, 0x2F, file_id]) + chunk
+            r = _send_and_wait(cmd, f"chunk_{chunks_sent}")
+            if not r["ok"]:
+                r["chunk_index"] = chunks_sent
+                return r
+            chunks_sent += 1
+            # The device's USB-MIDI receive buffer can overflow if we blast all
+            # chunks back-to-back. The 6.2 KB / 25-chunk preset goes through
+            # fine, but 25 KB / 99 chunks fails to persist — most likely the
+            # device's parser falls behind and the commit rolls back silently.
+            # Empirical: a small inter-chunk gap fixes uploads >~ 8 KB.
+            time.sleep(0.01)
+
+        # 4. Commit
+        commit = {"files": [{
+            "id": file_id, "location": "slots", "type": "preset",
+            "bankNumber": bank, "slot": slot, "md5": md5,
+        }]}
+        commit_json = _json.dumps(commit, separators=(",", ":")).encode("utf-8")
+        r = _send_and_wait(bytes([0x04, 0x2D]) + commit_json, "commit")
+        step_log.append(r)
+        if not r["ok"]:
+            return r
+
+        # 5. Switch active slot pointer to where we wrote the file. No-op if
+        #    we were already there, but ensures the next reload reads the right
+        #    file. The Switch command is `09 08 bank slot`.
+        switch_cmd = bytes([0x09, 0x08, bank & 0x7F, slot & 0x7F])
+        r = _send_and_wait(switch_cmd, "switch_preset")
+        step_log.append(r)
+
+        # 6. Reload the active preset slot — terminates the running instance
+        #    and re-reads from disk. This is what makes the preset display on
+        #    the device WITHOUT requiring a physical reboot. The simple
+        #    `01 01 Upload Preset` SysEx triggers this implicitly, but the FT
+        #    API requires an explicit reload after commit.
+        #    Command: F0 00 21 45 08 08 F7  (no bank/slot, reloads active)
+        reload_cmd = bytes([0x08, 0x08])
+        r = _send_and_wait(reload_cmd, "reload_slot")
+        step_log.append(r)
+
+        # First-and-last-chunk diagnostics
+        diag = {
+            "open_cache_ack": step_log[0].get("ack_hex"),
+            "register_ack": step_log[1].get("ack_hex"),
+            "commit_ack": step_log[-3].get("ack_hex") if len(step_log) >= 3 else None,
+            "switch_ack": step_log[-2].get("ack_hex") if len(step_log) >= 2 else None,
+            "reload_ack": step_log[-1].get("ack_hex"),
+        }
+        return {
+            "ok": True, "via": "file-transfer-api",
+            "size": size, "chunks": chunks_sent, "md5": md5,
+            "bank": bank, "slot": slot,
+            "diag": diag,
+        }
+    finally:
+        if listener_thread is not None:
+            listener_stop.set()
+            listener_thread.join(timeout=2.0)
 
 
 def listen_sysex(port_name: str, seconds: float) -> dict:
     """Capture SysEx messages from an input port for `seconds`.
 
-    Uses polling on the prepared buffers' MHDR_DONE flag (no Python callback,
-    so it doesn't depend on the GIL releasing to a callback thread). When a
-    buffer is filled, we copy its bytes out and re-arm it.
+    Uses a CALLBACK_FUNCTION that copies the bytes into a Python list under a
+    lock. The polling-based approach we tried earlier (reading MHDR_DONE)
+    returned only F0 followed by zeros — the driver fills the buffer
+    asynchronously and our reads raced with the write-back, so we got the
+    first byte and stale zeros for the rest. The callback approach lets the
+    driver fully finish before notifying us.
     """
+    import threading
+
     ports = list_ports()
     idx = _resolve_port(port_name, ports["inputs"])
     if idx is None:
         return {"ok": False, "error": f"input port not found: {port_name!r}", "available": ports["inputs"]}
 
-    CALLBACK_NULL = 0x00000000
-
-    handle = c_void_p()
-    rc = winmm.midiInOpen(byref(handle), idx, None, None, CALLBACK_NULL)
-    if rc != 0:
-        return {"ok": False, "error": f"midiInOpen failed: rc={rc}"}
-
+    CALLBACK_FUNCTION = 0x00030000
+    MIM_LONGDATA = 0x3C4
+    MIM_DATA = 0x3C3  # short messages, useful for verifying the listen pipe works at all
     captured: list[bytes] = []
-    short_captured: list[int] = []
+    short_messages: list[int] = []
+    lock = threading.Lock()
+
+    # WINFUNCTYPE generates the proper Windows stdcall trampoline + holds the
+    # GIL across boundary. The driver fires this on its own worker thread.
+    CallbackProto = ctypes.WINFUNCTYPE(None, c_void_p, c_uint, c_void_p, c_void_p, c_void_p)
+
     BUF_SIZE = 8192
     NUM_BUFS = 4
     headers = [MIDIHDR() for _ in range(NUM_BUFS)]
     buffers = [ctypes.create_string_buffer(BUF_SIZE) for _ in range(NUM_BUFS)]
+    handle = c_void_p()
 
-    def _prep_and_arm(i: int):
+    def _arm(i: int, do_prepare: bool = True):
         hdr = headers[i]
         hdr.lpData = ctypes.cast(buffers[i], ctypes.c_char_p)
         hdr.dwBufferLength = BUF_SIZE
         hdr.dwBytesRecorded = 0
         hdr.dwFlags = 0
-        winmm.midiInPrepareHeader(handle, byref(hdr), sizeof(hdr))
+        if do_prepare:
+            winmm.midiInPrepareHeader(handle, byref(hdr), sizeof(hdr))
         winmm.midiInAddBuffer(handle, byref(hdr), sizeof(hdr))
+
+    def _cb(hMidi, wMsg, dwInst, dwP1, dwP2):
+        if wMsg == MIM_LONGDATA and dwP1:
+            hdr_ptr = ctypes.cast(dwP1, POINTER(MIDIHDR))
+            hdr = hdr_ptr.contents
+            n = hdr.dwBytesRecorded
+            if n > 0:
+                # Read directly from the C buffer, NOT through hdr.lpData
+                # (the latter is a c_char_p which auto-truncates at first NUL —
+                # Electra SysEx contains 0x00 in the manufacturer id).
+                # We need to find which buffer this header refers to and read
+                # from the corresponding ctypes buffer.
+                for i in range(NUM_BUFS):
+                    if ctypes.addressof(headers[i]) == ctypes.addressof(hdr):
+                        raw = bytes(buffers[i].raw[:n])
+                        with lock:
+                            captured.append(raw)
+                        # Re-arm without re-preparing (driver keeps the prepare flag)
+                        # Actually: per Win32 docs, after MIM_LONGDATA we need to
+                        # unprepare then re-prepare to reuse the buffer.
+                        winmm.midiInUnprepareHeader(hMidi, hdr_ptr, sizeof(MIDIHDR))
+                        _arm(i, do_prepare=True)
+                        return
+        elif wMsg == MIM_DATA:
+            # Short MIDI message — encoded in low 24 bits of dwP1 (or c_void_p value).
+            # Useful purely as proof-of-life that the callback fires at all.
+            try:
+                val = ctypes.cast(dwP1, ctypes.c_void_p).value or 0
+            except (TypeError, ValueError):
+                val = 0
+            with lock:
+                short_messages.append(val & 0xFFFFFF)
+
+    cb = CallbackProto(_cb)
+    rc = winmm.midiInOpen(byref(handle), idx, ctypes.cast(cb, c_void_p), None, CALLBACK_FUNCTION)
+    if rc != 0:
+        return {"ok": False, "error": f"midiInOpen failed: rc={rc}"}
 
     try:
         for i in range(NUM_BUFS):
-            _prep_and_arm(i)
+            _arm(i, do_prepare=True)
         winmm.midiInStart(handle)
-        deadline = time.monotonic() + max(0.0, seconds)
-        while time.monotonic() < deadline:
-            any_done = False
-            for i, hdr in enumerate(headers):
-                if hdr.dwFlags & 0x1 and hdr.dwBytesRecorded > 0:  # MHDR_DONE
-                    raw = ctypes.string_at(
-                        ctypes.cast(hdr.lpData, c_void_p), hdr.dwBytesRecorded
-                    )
-                    captured.append(raw)
-                    winmm.midiInUnprepareHeader(handle, byref(hdr), sizeof(hdr))
-                    _prep_and_arm(i)
-                    any_done = True
-            if not any_done:
-                time.sleep(0.005)
+        # Sleep in small slices so the GIL is regularly released to the cb thread.
+        end = time.monotonic() + max(0.0, seconds)
+        while time.monotonic() < end:
+            time.sleep(0.01)
         winmm.midiInStop(handle)
+        winmm.midiInReset(handle) if hasattr(winmm, "midiInReset") else None
         for hdr in headers:
             winmm.midiInUnprepareHeader(handle, byref(hdr), sizeof(hdr))
     finally:
         winmm.midiInClose(handle)
 
     msgs = []
-    for raw in captured:
-        text = raw.decode("utf-8", errors="ignore")
-        msgs.append({"hex": raw.hex(), "text": text})
-    return {"ok": True, "port": ports["inputs"][idx]["name"], "messages": msgs}
+    with lock:
+        for raw in captured:
+            text = raw.decode("utf-8", errors="ignore")
+            msgs.append({"hex": raw.hex(), "text": text, "len": len(raw)})
+        shorts = list(short_messages)
+    return {
+        "ok": True,
+        "port": ports["inputs"][idx]["name"],
+        "messages": msgs,
+        "short_messages": [f"{m:06x}" for m in shorts[:50]],
+    }
 
 
 def main():
@@ -371,6 +594,8 @@ def main():
     up.add_argument("--bank", type=int, default=0)
     up.add_argument("--slot", type=int, default=0)
     up.add_argument("--chunk-bytes", type=int, default=1024)
+    up.add_argument("--no-verify-ack", action="store_true")
+    up.add_argument("--no-tx-id", action="store_true", help="skip transaction id wrapping (legacy firmware compat)")
 
     args = ap.parse_args()
 
@@ -384,15 +609,13 @@ def main():
     elif args.cmd == "upload-preset":
         with open(args.preset, "rb") as f:
             preset_bytes = f.read()
-        # minify by json round-trip to drop whitespace
-        try:
-            obj = json.loads(preset_bytes)
-            preset_bytes = json.dumps(obj, separators=(",", ":")).encode("utf-8")
-        except json.JSONDecodeError:
-            pass
+        # No JSON roundtrip — send raw bytes. Minifying changes the byte layout
+        # which makes the on-device MD5 verification mismatch (or so we suspect).
         result = upload_preset_file_transfer(
             args.port, preset_bytes,
             bank=args.bank, slot=args.slot, chunk_bytes=args.chunk_bytes,
+            verify_ack=not args.no_verify_ack,
+            use_tx_id=not args.no_tx_id,
         )
     else:
         result = {"ok": False, "error": f"unknown cmd: {args.cmd}"}
