@@ -394,6 +394,38 @@ See `server/win_bridge.py` in [electra-one-mcp](https://github.com/roomi-fields/
 
 Port to **Windows MIDI Services 1.0** (in-box service Microsoft shipped to Win 11 24H2 in Feb 2026; replaces `winmm.dll`) via `winsdk`/`pywinrt`. Not blocking — the current pipeline works — but it sidesteps USB-MIDI 1.0 fragmentation entirely.
 
+## MCP tools cheat sheet (20 tools available)
+
+When the user asks to do anything against a real device, prefer the MCP tools below over raw SysEx — they handle the WSL↔Windows bridge, ACK verification, and error reporting.
+
+| Need | Tool | Typical call |
+|---|---|---|
+| Push a widget to the device | `push_to_device` | `push_to_device(preset_path="widgets/X/demo.preset.json", bank=0, slot=0)` |
+| Run a Lua snippet (REPL) | `execute_lua` | `execute_lua("print(parameterMap.get(99))")` |
+| Read current device state | `device_state` | `device_state(seconds=2)` — returns last-known bank/slot/page + recent events + log |
+| Download main.lua from a slot | `get_lua_source` | `get_lua_source(bank=0, slot=0)` |
+| Subscribe to richer events | `subscribe_events` | `subscribe_events(["pots", "touch", "button"])` |
+| Capture device state back to repo | `pull_preset` | `pull_preset(bank=0, slot=0, out_path="widgets/X/demo.preset.json")` |
+| Upload secondary files | `upload_devices_overrides` / `upload_persisted_data` / `upload_performance` | path to JSON |
+| Upload reusable Lua module | `upload_lua_module` | `upload_lua_module(path, namespace="roomi", name="theme")` |
+| Clear a slot | `clear_preset_slot` | `clear_preset_slot(bank=0, slot=0)` |
+| Query firmware/serial | `device_status` | — |
+| Tail device log | `get_device_logs` | `get_device_logs(seconds=5)` |
+| Bundle theme+primitives+widget | `bundle_widget` | — |
+| Validate a preset offline | `validate_preset` | — |
+| Search official docs | `search_docs` / `get_api` / `list_constants` | — |
+| Look up any SysEx command | `get_sysex_command` | `get_sysex_command(query="snapshot")` — 62 commands |
+| Render preset to PNG via emulator | `screenshot_widget` | — |
+
+Typical iteration loop while developing a widget:
+
+1. `bundle_widget` (offline, generates the Lua blob)
+2. `validate_preset` (offline, catches schema/coord errors before push)
+3. `push_to_device` → reload happens automatically (slot-flip trick)
+4. `device_state` + `execute_lua` to inspect/debug
+5. Edit `widget.lua` → loop back to step 1
+6. `pull_preset` when device state has drifted ahead of repo
+
 ## Reflex when something breaks silently on device
 
 - Widget renders as a blue bar / default fader → paint callback raised an
