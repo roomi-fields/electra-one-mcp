@@ -438,6 +438,49 @@ def list_constants(category: str = "all") -> dict[str, Any]:
 
 
 @mcp.tool()
+def get_sysex_command(query: str = "", category: str = "all") -> dict[str, Any]:
+    """Look up Electra One SysEx command(s) by name or category.
+
+    Catalog of 63 commands extracted from app.electra.one's JS bundle +
+    docs.electra.one. For each: the exact byte sequence (e.g.
+    `F0 00 21 45 09 08 <bank> <slot> F7`), payload shape, response prefix,
+    and a one-line purpose. The agent should call this BEFORE attempting
+    to send a SysEx the MCP doesn't already wrap as a high-level tool.
+
+    Args:
+        query: case-insensitive substring of command name (e.g. "snapshot",
+               "upload", "lua"). Empty = return everything in the category.
+        category: filter by category — one of `queries`, `uploads_simple`,
+                  `file_transfer`, `navigation_runtime`, `persistent_changes`,
+                  `events_device_to_host`, or `all`.
+    """
+    cat_file = DOCS_STRUCTURED / "sysex_commands.json"
+    if not cat_file.exists():
+        return {"ok": False, "error": "docs/structured/sysex_commands.json not found"}
+    catalog = json.loads(cat_file.read_text(encoding="utf-8"))
+    meta = catalog.pop("_meta", {})
+
+    categories = list(catalog.keys()) if category == "all" else [category]
+    needle = query.lower().strip()
+
+    hits = []
+    for cat in categories:
+        for cmd in catalog.get(cat, []):
+            if not needle or needle in cmd.get("name", "").lower():
+                hits.append({"category": cat, **cmd})
+
+    return {
+        "ok": True,
+        "query": query,
+        "category": category,
+        "manufacturer_id": meta.get("manufacturer_id"),
+        "ack_format": meta.get("ack_format"),
+        "count": len(hits),
+        "commands": hits,
+    }
+
+
+@mcp.tool()
 def validate_preset(preset_json: str) -> dict[str, Any]:
     """Check a preset JSON against schema + known-bad patterns.
 
