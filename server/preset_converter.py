@@ -65,6 +65,18 @@ class _MK2Layout:
         y = _MK2Layout.slot_to_y(slot_id)
         return y // 4 + 1
 
+    @staticmethod
+    def bounds_to_slot(bounds: list[int], page_id: int = 1) -> int:
+        """Inverse of slot_to_bounds: figure out which slot a (x, y, w, h)
+        control occupies. Mirrors `boundsToSlotId` from the bundle (offset
+        ~159446). Used by preset_to_project to convert controls back to tiles."""
+        x_px, y_px = bounds[0], bounds[1]
+        col = x_px // 170
+        # rowGroup: 0 for top half (y < 90), 1 for next, etc.
+        row_section = (y_px - 6) // 90
+        row_offset = 0 if (y_px - 6) % 90 == 0 else 1
+        return 72 * (page_id - 1) + 6 * (2 * row_section + row_offset) + col
+
 
 # --- mini layout (4 cols × 6 rows = 24 per page) for completeness
 
@@ -228,6 +240,103 @@ def lua_to_ascii(lua: str) -> bytes:
     middle-dot, arrows etc. in comments) are dropped — the device only accepts
     7-bit data over SysEx and these characters don't affect Lua execution."""
     return lua.encode("ascii", errors="ignore")
+
+
+def preset_to_project(preset: dict, target_device: str = "mk2") -> dict:
+    """Convert a device-format preset (`controls` schema) BACK to our widget
+    repo's `tiles` schema. Mirrors `presetToProject` from app.electra.one's
+    bundle (offset ~134272 in 0c61af0.js).
+
+    Use case: pull a preset off the device after editing in the web editor
+    (or after another tool wrote it), and save it back into our repo's
+    widget format for diffing / version control.
+
+    Each control becomes one tile:
+      - `id` becomes `reference` (numeric)
+      - the tile gets a fresh string `id` (uuid-ish — pseudo-uuid based on
+        original id since we don't ship the `uuid` package)
+      - `bounds` is reverse-mapped to `slotId` via `boundsToSlotId`
+      - `inputs`, `controlSetId`, `pageId` are dropped (the forward
+        converter regenerates them from slotId)
+
+    Groups become `type:"label"` tiles with a `span` computed from bounds.
+
+    Devices are filtered to only those actually referenced by some control.
+    Pages are filtered to those that hold at least one control.
+    """
+    layout = _LAYOUTS.get(target_device, _MK2Layout)
+
+    def _control_to_tile(control: dict, *, is_label: bool = False) -> dict:
+        t = dict(control)
+        bounds = t.get("bounds")
+        page_id = t.get("pageId", 1)
+        if bounds:
+            t["slotId"] = layout.bounds_to_slot(bounds, page_id)
+        if "id" in t:
+            t["reference"] = t["id"]
+        # Fresh string id (the editor uses real UUIDs; we mimic with a
+        # deterministic-but-unique-looking string so repeated pulls of the
+        # same preset stay diff-friendly)
+        if "reference" in t:
+            t["id"] = f"control-{t['reference']}"
+
+        # If the value carries an overlayId, denormalise the overlay items
+        # back into the tile's value object (web editor does the same)
+        if t.get("values") and isinstance(t["values"], list) and t["values"]:
+            primary = t["values"][0]
+            overlay_id = primary.get("overlayId") if isinstance(primary, dict) else None
+            if overlay_id and isinstance(preset.get("overlays"), list):
+                ov = next((o for o in preset["overlays"] if o.get("id") == overlay_id), None)
+                if ov:
+                    primary["textValues"] = ov.get("items", [])
+
+        # Strip fields that the forward converter regenerates
+        for k in ("controlSetId", "pageId", "inputs", "bounds"):
+            t.pop(k, None)
+
+        if is_label:
+            t["type"] = "label"
+            if bounds:
+                t["span"] = max(1, bounds[2] // 146)
+
+        return t
+
+    tiles_from_controls = [_control_to_tile(c) for c in preset.get("controls", []) or []]
+    tiles_from_groups   = [_control_to_tile(g, is_label=True) for g in preset.get("groups", []) or []]
+    all_tiles = tiles_from_controls + tiles_from_groups
+
+    # Filter devices: only those referenced by some tile
+    device_ids_in_use = set()
+    page_ids_in_use = set()
+    for t in all_tiles:
+        slot_id = t.get("slotId")
+        if slot_id is not None:
+            page_ids_in_use.add(layout.slot_to_page_id(slot_id))
+        if t.get("deviceId"):
+            device_ids_in_use.add(t["deviceId"])
+
+    devices = [
+        {**d, "instrumentId": d.get("instrumentId") or "generic-controls"}
+        for d in (preset.get("devices") or [])
+        if d.get("id") in device_ids_in_use or not device_ids_in_use
+    ]
+
+    # Filter pages to those that hold at least one tile
+    pages_src = preset.get("pages") or [{"id": 1, "name": "Page 1"}]
+    if isinstance(pages_src, dict):
+        pages_src = list(pages_src.values())
+    pages = [p for p in pages_src if p.get("id") in page_ids_in_use] or pages_src
+
+    return {
+        "schemaVersion": 2,
+        "id": preset.get("projectId") or "",
+        "version": preset.get("version", 2),
+        "name": preset.get("name") or "Untitled",
+        "targetDevice": target_device,
+        "devices": devices,
+        "tiles": all_tiles,
+        "pages": pages,
+    }
 
 
 def split_preset_for_upload(project: dict, target_device: str = "mk2") -> tuple[bytes, bytes | None]:

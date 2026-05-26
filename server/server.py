@@ -519,6 +519,112 @@ def clear_preset_slot(bank: int, slot: int,
 
 
 @mcp.tool()
+def pull_preset(bank: int | None = None, slot: int | None = None,
+                out_path: str | None = None,
+                out_port: str = "MIDIOUT3 (Electra Controller)",
+                in_port: str = "MIDIIN3 (Electra Controller)") -> dict[str, Any]:
+    """Download a preset from the device + reverse-convert to our `tiles` schema.
+
+    Combines:
+    - `02 01 Get Active Preset` (or `02 01 <bank> <slot>` for a specific slot)
+    - `02 0C Get Lua Script` to fetch main.lua
+    - `preset_to_project()` to convert the controls schema back to the
+      tiles schema our widget repo uses
+
+    The result is a JSON in the same format as `widgets/*/demo.preset.json`
+    — you can save it directly into the repo, diff it against the source,
+    and re-push with `upload-preset` later.
+
+    If `out_path` is set, the JSON is written there. Otherwise it's returned
+    in the response.
+
+    Args:
+        bank, slot: which slot to pull (omit both for active slot)
+        out_path: optional file to write the result to
+    """
+    # Step 1 — fetch preset JSON via Get Active Preset / Get Preset
+    if _is_wsl():
+        # We don't have a CLI wrapper for raw "get preset" yet; use a custom
+        # SysEx via the existing send + listen pattern. Reuse get_lua's
+        # listener pattern by invoking listen_sysex around a manual send.
+        # Simplest path: write the request payload to %TEMP%, send, listen.
+        win_tmp = _windows_temp_dir()
+        if win_tmp is None:
+            return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+        req = bytes([0xF0, 0x00, 0x21, 0x45, 0x02, 0x01])
+        if bank is not None and slot is not None:
+            req += bytes([bank & 0x7F, slot & 0x7F])
+        req += bytes([0xF7])
+        req_path = win_tmp / "electra-one-mcp" / "get_preset.bin"
+        req_path.parent.mkdir(parents=True, exist_ok=True)
+        req_path.write_bytes(req)
+        win_req = subprocess.run(["wslpath", "-w", str(req_path)],
+                                  capture_output=True, text=True, timeout=5).stdout.strip()
+        # Use a small helper: kick off listen on a background "job" via the
+        # bridge, then send. To keep it simple, do listen + send separately
+        # via the bridge's existing listen/send subcommands.
+        # Listen in background (PowerShell job), send, gather.
+        listen_cmd = (
+            f"$j = Start-Job -ScriptBlock {{ py -3.13 ${{env:TEMP}}\\electra-one-mcp\\win_bridge.py listen --port '{in_port}' --seconds 4 }};"
+            "Start-Sleep -Milliseconds 400;"
+            f"py -3.13 ${{env:TEMP}}\\electra-one-mcp\\win_bridge.py send --port '{out_port}' --payload '{win_req}' --chunk-size 32768 | Out-Null;"
+            "Wait-Job $j | Out-Null;"
+            "Receive-Job $j;"
+            "Remove-Job $j;"
+        )
+        ps = subprocess.run(["powershell.exe", "-NoProfile", "-Command", listen_cmd],
+                             capture_output=True, text=True, timeout=15)
+        # Parse listener output
+        try:
+            listen_json = json.loads(ps.stdout.strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError):
+            return {"ok": False, "error": "could not parse listen output", "raw": ps.stdout[:500]}
+        # Reassemble preset bytes from `01 01` responses
+        preset_bytes = b""
+        for m in listen_json.get("messages", []):
+            raw = bytes.fromhex(m["hex"])
+            if len(raw) >= 7 and raw[1:5] == bytes([0x00, 0x21, 0x45, 0x01]) and raw[5] == 0x01:
+                preset_bytes += raw[6:-1]
+    else:
+        return {"ok": False, "error": "pull_preset currently requires WSL bridge path"}
+
+    if not preset_bytes:
+        return {"ok": False, "error": "no preset returned (active slot empty?)"}
+
+    try:
+        preset = json.loads(preset_bytes)
+    except json.JSONDecodeError as e:
+        return {"ok": False, "error": f"preset JSON parse failed: {e}", "raw": preset_bytes[:300].decode("utf-8", errors="replace")}
+
+    # Step 2 — fetch the Lua via get_lua_source (existing tool)
+    lua_result = get_lua_source(bank=bank, slot=slot, out_port=out_port,
+                                  in_port=in_port, listen_seconds=3.0)
+    lua_text = lua_result.get("lua", "") if isinstance(lua_result, dict) else ""
+
+    # Step 3 — reverse-convert to tiles schema
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from preset_converter import preset_to_project
+    project = preset_to_project(preset, target_device="mk2")
+    if lua_text:
+        project["lua"] = lua_text
+
+    if out_path:
+        Path(out_path).write_text(json.dumps(project, indent=2), encoding="utf-8")
+        return {
+            "ok": True, "bank": bank, "slot": slot,
+            "tiles_count": len(project.get("tiles", [])),
+            "lua_length": len(lua_text),
+            "written_to": out_path,
+        }
+    return {
+        "ok": True, "bank": bank, "slot": slot,
+        "tiles_count": len(project.get("tiles", [])),
+        "lua_length": len(lua_text),
+        "project": project,
+    }
+
+
+@mcp.tool()
 def get_device_logs(seconds: float = 5.0, port: str | None = None) -> dict[str, Any]:
     """Listen on the CTRL port for `lua:` log messages from the device.
 
