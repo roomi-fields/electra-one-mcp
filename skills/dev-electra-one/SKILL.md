@@ -343,73 +343,56 @@ graph-based widgets) before improvising.
   added fatal-error Lua handler, fixed RGB888→RGB565 translation,
   fixed memory leak in `controls.get()`).
 
-## Pushing presets to a real device via SysEx (Windows USB-MIDI specifics)
+## Pushing presets to a real device via SysEx (autonomous workflow)
 
-These notes apply when the MCP `push_to_device` tool runs against a physical
-Electra One MK2 over USB on a Windows host. Learned the hard way (forum #592
-corroboration + on-hardware testing 2026-05-25/26).
+The MCP can push any widget in this repo to the device with a single command:
 
-**The simple `01 01` upload command is fragile above ~5 KB on Windows.** The
-USB-MIDI 1.0 class driver fragments large `midiOutLongMsg` calls at the USB
-packet layer, and the device parses only the first fragment as a truncated
-preset. Windows updates KB5077181 / KB5074105 (late 2025) made this worse.
-Don't try to brute-force it by splitting `midiOutLongMsg` calls of the same
-SysEx — each call becomes its own SysEx frame on the wire (own start/end
-markers) and the device sees N small malformed presets, not one big one.
+```bash
+python3 server/win_bridge.py upload-preset \
+  --preset widgets/step-seq-16/demo.preset.json \
+  --port "MIDIOUT3 (Electra Controller)" \
+  --bank 0 --slot 0 --mode simple
+```
 
-**Use the File Transfer API for any preset > ~5 KB.** Each step is its own
-small complete SysEx so the driver doesn't fragment:
-1. Open cache:    `F0 00 21 45 01 2D F7`
-2. Register file: `F0 00 21 45 01 2E <fileId> <s0> <s1> <s2> <s3> F7` — size split as four 7-bit bytes, LE
-3. Chunks (≤ 1-2 KB ASCII each): `F0 00 21 45 01 2F <fileId> <data> F7`
-4. Commit: `F0 00 21 45 04 2D {"files":[{"id":1,"location":"slots","type":"preset","bankNumber":B,"slot":S,"md5":"<32-hex>"}]} F7` — MD5 over the **decoded** payload (raw JSON), not the SysEx-wrapped bytes.
-5. Include a **Transaction ID** in every step (firmware ≥ 4.0): insert `0x00 <txid-lsb> <txid-msb>` right after the manufacturer id. Without it, ACKs can't be correlated.
+What happens under the hood (the pipeline mirrors what `app.electra.one` does internally):
 
-**ACK format**: `F0 00 21 45 7E 01 <txid-lsb> <txid-msb> F7` (success); `7E 00 …` for NACK. Check after every command; bail on NACK with a useful error.
+1. Detect schema: `tiles` schema → call `preset_converter.split_preset_for_upload()` to produce (preset_json_bytes_in_controls_schema, lua_bytes).
+2. `09 08 bank slot` Switch Preset Slot — arm target.
+3. `01 01 <preset.json>` Upload Preset — small (< 1 KB once Lua is stripped), goes in one SysEx without fragmentation issues.
+4. `01 0C <main.lua>` Upload Lua Script — the entire bundled Lua (~40 KB for step-seq-16).
+5. Slot-flip reload: `09 08 bank (slot XOR 1)` then `09 08 bank slot`. `08 08 Reload Preset Slot` NACKs on firmware 4.1.4 in our tests, so we use this trick instead to force a cold re-init.
 
-**CTRL port on Windows for this hardware**: `MIDIOUT3 (Electra Controller)` ↔ `MIDIIN3 (Electra Controller)`. The bare-named "Electra Controller" is port 1, MIDIOUT2/IN2 is port 2.
+Each step waits for ACK on the CTRL input port; NACK aborts.
 
-**Listening for ACKs (winmm + ctypes) — two non-obvious traps**:
-- **Polling `MHDR_DONE` races the driver write-back** → you read `F0` followed by zeros. Use `CALLBACK_FUNCTION` with `WINFUNCTYPE` so the driver hands you a complete buffer.
-- **`hdr.lpData` as `c_char_p` truncates at the first NUL byte** (Electra SysEx contains `0x00` right after `F0`). Don't read via `lpData`. Keep the Python-side `ctypes.create_string_buffer` allocations in a list, find which one this header refers to via `ctypes.addressof(headers[i]) == ctypes.addressof(hdr)`, and read `buffers[i].raw[:n]`.
+**The converter** (`server/preset_converter.py`) is a Python port of `projectToPreset` from app.electra.one's JS bundle (`0c61af0.js`, offset ~127000–131000) plus the MK2 6×12 layout math (`slotIdToBounds`, `slotIdToPot`, `slotIdToSet`, `slotIdToPageId`) at offset ~159200. Verified byte-identical against a live sniff (slotId=1, span=undef → bounds=[181,6,158,16], potId=8).
 
-**Long-term path** (when Win 10 support can be dropped): port to **Windows MIDI Services 1.0** via `winsdk` / `pywinrt`. Shipped to Win 11 in Feb 2026; replaces `winmm.dll` and fixes the USB-MIDI 1.0 fragmentation issue.
+### Why the converter exists
 
-**Reference impl + ongoing state**: `server/win_bridge.py` in [electra-one-mcp](https://github.com/roomi-fields/electra-one-mcp). See `HOWTO.md` section "Pushing presets via SysEx" for the full play-by-play and forum thread #592.
+The widget files in `electraone-widgets/widgets/*/demo.preset.json` use a "new" schema (`schemaVersion`, `tiles[]`, `targetDevice`, `firstPageId`, `categoryId`). None of those keys appear in [presetformat.html](https://docs.electra.one/developers/presetformat.html). The device firmware parses the **documented** schema only: `version` (numeric) + `pages` + `devices` + `overlays` + `groups` + `controls[]`. Pushing the raw "tiles" JSON via `01 01` ACKs at the transport level but the preset parser silently rejects the structure, and the screen stays empty.
 
-**Major root-cause discovery (2026-05-26): preset schema mismatch.**
+### CTRL port on Windows for this hardware
 
-The widget files in `electraone-widgets/widgets/*/demo.preset.json` use a
-"new" schema that the **device firmware does not parse via direct SysEx**:
-`schemaVersion`, `tiles`, `targetDevice`, `firstPageId`, `categoryId` per
-tile — none of these appear in [presetformat.html](https://docs.electra.one/developers/presetformat.html). The documented schema uses `version` (numeric), `pages`,
-`devices`, `overlays`, `groups`, `controls` (no `tiles`).
+- `MIDIOUT3 (Electra Controller)` ↔ `MIDIIN3 (Electra Controller)` = USB port 3 = CTRL (admin, file transfer, events).
+- `MIDIOUT2` / `MIDIIN2` = port 2; bare `Electra Controller` = port 1.
 
-The web editor at `app.electra.one` converts our "tiles" schema to the
-documented "controls" schema before sending the SysEx. Pushing the raw
-"tiles"-format JSON via `01 01` (or via the FT API with `type:"preset"`)
-**ACKs successfully at the transport level but the on-device preset parser
-silently rejects the structure** — `Get Active Preset` (`02 01`) afterwards
-returns 0 bytes, and the screen shows "no name - page 1" or stays empty.
+### Listening for ACKs (winmm + ctypes) — two traps to know
 
-This explains every "silent rollback" we've observed for big presets — it
-was never a size/MD5/chunking issue, it was always a schema mismatch.
+1. **Polling `MHDR_DONE` races the driver write-back** → reads return `F0` followed by zeros. Use `CALLBACK_FUNCTION` with `WINFUNCTYPE` so the driver only hands you a complete buffer.
+2. **`hdr.lpData` as `c_char_p` truncates at the first NUL.** Electra SysEx contains `0x00` right after `F0`. Keep the `ctypes.create_string_buffer` allocations Python-side and slice `buffers[i].raw[:n]` directly.
 
-To push to the device without going through the website, you need to either:
-- Convert tiles → controls/groups before upload (and route the inlined `lua`
-  field to a separate `01 0C` upload, per docs)
-- Or sniff what app.electra.one actually sends (`navigator.requestMIDIAccess`
-  → wrap `MIDIOutput.send`) and replicate that exact byte sequence
+See `server/win_bridge.py` in [electra-one-mcp](https://github.com/roomi-fields/electra-one-mcp) for the full impl.
 
-The MCP `push_to_device` in v0.x assumes the documented "controls" schema.
-For "tiles"-schema presets, you must convert first or upload via the web app.
+### Empirical limits confirmed on firmware 4.1.4 (2026-05-26)
 
-**Empirical limits confirmed on firmware 4.1.4 (2026-05-26)**:
-- < ~5 KB via simple `01 01` upload: works, displays immediately
-- < ~6 KB via FT API: commit succeeds, file persists, displays after reload trigger
-- ≥ ~25 KB via FT API: all chunks ACK'd, commit ACK'd, `7E 05` + `7E 02` events fire, **but `Get Active Preset` (`02 01`) afterwards returns 0 bytes**. The file does not actually land on disk — silent MD5-rollback most likely. Open issue.
-- **`Reload Preset Slot` (`08 08`) returns NACK** in 4.1.4 despite docs listing it as no-args. Either docs are wrong about the args, or the command got renamed.
-- **No SysEx query for "which bank/slot is on screen"**. Maintain client state by passively listening for unsolicited `7E 02 bank slot` (preset switch) and `7E 08 bank` (bank switch) events on the CTRL port.
+- Direct `01 01` Upload Preset works fine for our converted presets (< 1 KB without inlined Lua).
+- `01 0C` Upload Lua with ~40 KB Lua source works in a single SysEx on this hardware over MIDIOUT3 — driver behaviour varies by host, see HOWTO for caveats.
+- File Transfer API (`01 2D / 2E / 2F / 04 2D`) is implemented but **not the recommended path** for preset+lua: the docs scope it to firmware / lua modules / multi-file atomic deploys; preset commit silently rolls back. Forum #592 reaches the same conclusion.
+- `08 08 Reload Preset Slot` returns NACK on 4.1.4 — use the slot-flip trick instead.
+- No SysEx query for "which bank/slot is currently displayed". Maintain client state by listening for unsolicited `7E 02 bank slot` and `7E 08 bank` events on the CTRL port. The MCP will expose a `device_state` tool for this once Phase C of the rollout ships.
+
+### Long-term path
+
+Port to **Windows MIDI Services 1.0** (in-box service Microsoft shipped to Win 11 24H2 in Feb 2026; replaces `winmm.dll`) via `winsdk`/`pywinrt`. Not blocking — the current pipeline works — but it sidesteps USB-MIDI 1.0 fragmentation entirely.
 
 ## Reflex when something breaks silently on device
 
