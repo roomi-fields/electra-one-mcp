@@ -358,9 +358,16 @@ def upload_preset_simple(
             if not r["ok"]:
                 return r
 
-        # 4. Reload Preset Slot
-        r = _send_and_wait(bytes([0x08, 0x08]), "reload_slot")
-        # Don't fail on reload NACK — file is already written.
+        # 4. Force reload via slot-switch trick:
+        #    08 08 Reload Preset Slot often NACKs on this firmware. Going to a
+        #    different slot then back forces the device to fully tear down the
+        #    runtime and re-init from disk (lua + preset together). The
+        #    "neighbour" slot we visit briefly is bank/(slot XOR 1) — that
+        #    keeps us within the same bank and only flips one bit.
+        neighbour = slot ^ 1 if slot < 11 else slot - 1
+        _send_and_wait(bytes([0x09, 0x08, bank & 0x7F, neighbour & 0x7F]), "switch_away")
+        time.sleep(0.15)
+        r = _send_and_wait(bytes([0x09, 0x08, bank & 0x7F, slot & 0x7F]), "switch_back")
 
         return {
             "ok": True, "via": "simple-01-01-and-01-0c",
@@ -796,20 +803,24 @@ def main():
     elif args.cmd == "listen":
         result = listen_sysex(args.port, args.seconds)
     elif args.cmd == "upload-preset":
-        with open(args.preset, "rb") as f:
-            preset_bytes = f.read()
-        # Strip inline "lua" field — it must ride a separate upload per docs
-        # (luaext.html, midiimplementation.html). The preset's JSON schema has
-        # no "lua" field; the device parser silently discards it.
-        lua_bytes = None
-        try:
-            obj = json.loads(preset_bytes)
-            lua_content = obj.pop("lua", "")
-            if isinstance(lua_content, str) and lua_content.strip():
-                lua_bytes = lua_content.encode("ascii", errors="ignore")
-            preset_bytes = json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("ascii")
-        except (json.JSONDecodeError, UnicodeEncodeError):
-            pass
+        with open(args.preset, encoding="utf-8") as f:
+            project = json.loads(f.read())
+
+        # If this is a "tiles"-schema project (our widget repo format), convert
+        # it to the "controls" format the firmware actually parses. The
+        # converter mirrors app.electra.one's projectToPreset (see
+        # server/preset_converter.py) and produces byte-identical output to
+        # what the web editor sends.
+        from preset_converter import split_preset_for_upload, project_to_preset
+        is_tiles = "tiles" in project or "schemaVersion" in project
+        if is_tiles:
+            target = project.get("targetDevice", "mk2")
+            preset_bytes, lua_bytes = split_preset_for_upload(project, target_device=target)
+        else:
+            # Already in controls format — just strip lua + minify
+            lua_raw = project.pop("lua", "")
+            lua_bytes = lua_raw.encode("ascii", errors="ignore") if (lua_raw and lua_raw.strip()) else None
+            preset_bytes = json.dumps(project, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
         if args.mode == "simple":
             result = upload_preset_simple(
