@@ -1021,6 +1021,187 @@ _EVENT_FLAGS = {
 }
 
 
+def _send_simple_cmd(out_port: str, op: int, resource: int, payload: bytes = b"",
+                     in_port: str | None = None, ack_timeout: float = 3.0) -> dict:
+    """Send a single `F0 00 21 45 <op> <res> <payload> F7` SysEx and wait for ACK.
+
+    Used by all the Phase-D wrappers (upload_devices, upload_persisted, etc.)
+    plus clear_preset_slot. Returns the ACK hex, NACK if any.
+
+    The listener runs on a background thread so we can capture the ACK
+    even when payload is large (preset.json / lua-module).
+    """
+    import threading
+
+    if in_port is None:
+        in_port = out_port.replace("MIDIOUT", "MIDIIN")
+        if in_port == out_port:
+            in_port = "MIDIIN3 (Electra Controller)"
+
+    blob = bytes([0xF0, 0x00, 0x21, 0x45, op & 0x7F, resource & 0x7F]) + payload + bytes([0xF7])
+
+    result_box: dict = {}
+    def _runner():
+        result_box["data"] = listen_sysex(in_port, ack_timeout + 0.4)
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    time.sleep(0.15)
+
+    ports = list_ports()
+    out_idx = _resolve_port(out_port, ports["outputs"])
+    if out_idx is None:
+        return {"ok": False, "error": f"output port not found: {out_port!r}"}
+    handle = c_void_p()
+    rc = winmm.midiOutOpen(byref(handle), out_idx, None, None, 0)
+    if rc != 0:
+        return {"ok": False, "error": f"midiOutOpen rc={rc}"}
+    try:
+        rc = _send_one_chunk(handle, blob)
+    finally:
+        winmm.midiOutClose(handle)
+    if rc != 0:
+        return {"ok": False, "error": f"send rc={rc}"}
+
+    t.join(timeout=ack_timeout + 1.0)
+    ack = None
+    ack_hex = None
+    for m in result_box.get("data", {}).get("messages", []):
+        ev = _classify_sysex_event(bytes.fromhex(m["hex"]))
+        if ev["kind"] == "event" and ev["name"] in ("ack", "nack"):
+            ack = ev["name"]
+            ack_hex = ev["hex"]
+            break
+    return {
+        "ok": ack == "ack",
+        "ack": ack,
+        "ack_hex": ack_hex,
+        "sent_bytes": len(blob),
+        "op_res": f"{op:02X} {resource:02X}",
+    }
+
+
+def _ascii_payload(text_or_path: str, *, from_file: bool) -> bytes:
+    raw = open(text_or_path, "rb").read() if from_file else text_or_path.encode("utf-8")
+    # device wants 7-bit ASCII for JSON/Lua payloads
+    try:
+        obj = json.loads(raw)
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+    except (json.JSONDecodeError, ValueError):
+        return raw.decode("utf-8", errors="ignore").encode("ascii", errors="ignore")
+
+
+def upload_devices_overrides(out_port: str, devices_json: str, from_file: bool = True,
+                              in_port: str | None = None) -> dict:
+    """Upload devices.json (device routing overrides) to the active preset slot.
+
+    SysEx: `F0 00 21 45 01 0F <devices-json> F7`.
+    Doc: https://docs.electra.one/developers/midiimplementation.html#upload-device-overrides
+    """
+    payload = _ascii_payload(devices_json, from_file=from_file)
+    return _send_simple_cmd(out_port, 0x01, 0x0F, payload, in_port=in_port)
+
+
+def upload_persisted_data(out_port: str, data_json: str, from_file: bool = True,
+                           in_port: str | None = None) -> dict:
+    """Upload data.json (persisted Lua table) to the active preset slot.
+
+    SysEx: `F0 00 21 45 01 12 <data-json> F7`.
+    Doc: https://docs.electra.one/developers/midiimplementation.html#upload-persisted-data
+    """
+    payload = _ascii_payload(data_json, from_file=from_file)
+    return _send_simple_cmd(out_port, 0x01, 0x12, payload, in_port=in_port)
+
+
+def upload_performance(out_port: str, performance_json: str, from_file: bool = True,
+                        in_port: str | None = None) -> dict:
+    """Upload performance.json to the active preset slot.
+
+    SysEx: `F0 00 21 45 01 11 <perf-json> F7`.
+    Doc: https://docs.electra.one/developers/midiimplementation.html#upload-performance
+    """
+    payload = _ascii_payload(performance_json, from_file=from_file)
+    return _send_simple_cmd(out_port, 0x01, 0x11, payload, in_port=in_port)
+
+
+def clear_preset_slot(out_port: str, bank: int, slot: int,
+                       in_port: str | None = None) -> dict:
+    """Clear all files in a preset slot (preset.json + main.lua + devices.json + ...).
+
+    SysEx: `F0 00 21 45 05 08 <bank> <slot> F7`.
+    Doc: https://docs.electra.one/developers/midiimplementation.html#clear-preset-slot-files
+    """
+    return _send_simple_cmd(out_port, 0x05, 0x08,
+                             bytes([bank & 0x7F, slot & 0x7F]),
+                             in_port=in_port)
+
+
+def remove_preset(out_port: str, bank: int, slot: int,
+                  in_port: str | None = None) -> dict:
+    """Delete a preset entirely (alternative to clear_preset_slot).
+
+    SysEx: `F0 00 21 45 05 01 <bank> <slot> F7`.
+    """
+    return _send_simple_cmd(out_port, 0x05, 0x01,
+                             bytes([bank & 0x7F, slot & 0x7F]),
+                             in_port=in_port)
+
+
+def upload_lua_module(out_port: str, namespace: str, name: str,
+                       source: str, from_file: bool = True,
+                       in_port: str | None = None) -> dict:
+    """Upload a Lua module (reusable library) into /ctrlv2/lua/<namespace>/<name>.lua.
+
+    Lua modules go via the File Transfer API with type:"luaModule" — they
+    are NOT slot-bound (a slot's main.lua can `require("<namespace>.<name>")`
+    them). This is the only path that supports namespaced libraries.
+
+    Args:
+        namespace: developer nickname / org name (used as folder name)
+        name: file name (without `.lua` extension)
+        source: Lua source — either a string or a path to a .lua file
+                (set from_file=True)
+    """
+    import hashlib
+
+    raw = open(source, "rb").read() if from_file else source.encode("utf-8")
+    lua_bytes = raw.decode("utf-8", errors="ignore").encode("ascii", errors="ignore")
+    md5 = hashlib.md5(lua_bytes).hexdigest()
+    size = len(lua_bytes)
+
+    # 1. Open cache
+    r = _send_simple_cmd(out_port, 0x01, 0x2D, in_port=in_port)
+    if not r["ok"]:
+        return {**r, "step": "open_cache"}
+
+    # 2. Register file
+    s0 = size & 0x7F; s1 = (size >> 7) & 0x7F
+    s2 = (size >> 14) & 0x7F; s3 = (size >> 21) & 0x7F
+    r = _send_simple_cmd(out_port, 0x01, 0x2E, bytes([1, s0, s1, s2, s3]), in_port=in_port)
+    if not r["ok"]:
+        return {**r, "step": "register"}
+
+    # 3. Chunks of 1024 bytes
+    chunks_sent = 0
+    for offset in range(0, size, 1024):
+        chunk = lua_bytes[offset:offset + 1024]
+        r = _send_simple_cmd(out_port, 0x01, 0x2F, bytes([1]) + chunk, in_port=in_port)
+        if not r["ok"]:
+            return {**r, "step": f"chunk_{chunks_sent}"}
+        chunks_sent += 1
+        time.sleep(0.005)
+
+    # 4. Commit
+    commit_json = json.dumps({"files": [{
+        "id": 1, "location": "modules", "type": "luaModule",
+        "namespace": namespace, "path": name, "md5": md5,
+    }]}, separators=(",", ":"))
+    r = _send_simple_cmd(out_port, 0x04, 0x2D, commit_json.encode("ascii"), in_port=in_port)
+    return {
+        **r, "step": "commit",
+        "namespace": namespace, "name": name, "size": size, "chunks": chunks_sent, "md5": md5,
+    }
+
+
 def subscribe_events(out_port: str, flags: list[str]) -> dict:
     """Subscribe to additional event categories (`14 79 <bitmask>`).
 
@@ -1107,6 +1288,30 @@ def main():
     se.add_argument("--flags", nargs="+", required=True,
                     help="any of: page controlset usb pots touch button window")
 
+    # Phase D — multi-file uploads + slot management
+    ud = sub.add_parser("upload-devices", help="upload devices.json (device overrides) — 01 0F")
+    ud.add_argument("--port", required=True)
+    ud.add_argument("--path", required=True, help="path to devices.json")
+    upd = sub.add_parser("upload-persisted", help="upload data.json (persisted Lua table) — 01 12")
+    upd.add_argument("--port", required=True)
+    upd.add_argument("--path", required=True, help="path to data.json")
+    upr = sub.add_parser("upload-performance", help="upload performance.json — 01 11")
+    upr.add_argument("--port", required=True)
+    upr.add_argument("--path", required=True, help="path to performance.json")
+    ulm = sub.add_parser("upload-lua-module", help="upload a Lua module to /ctrlv2/lua/<ns>/<name>.lua via FT API")
+    ulm.add_argument("--port", required=True)
+    ulm.add_argument("--namespace", required=True, help="developer nickname / org name")
+    ulm.add_argument("--name", required=True, help="module filename without .lua extension")
+    ulm.add_argument("--path", required=True, help="path to the .lua source file")
+    cs = sub.add_parser("clear-slot", help="clear a preset slot (delete all files) — 05 08")
+    cs.add_argument("--port", required=True)
+    cs.add_argument("--bank", type=int, required=True)
+    cs.add_argument("--slot", type=int, required=True)
+    rp = sub.add_parser("remove-preset", help="alternative to clear-slot — 05 01")
+    rp.add_argument("--port", required=True)
+    rp.add_argument("--bank", type=int, required=True)
+    rp.add_argument("--slot", type=int, required=True)
+
     args = ap.parse_args()
 
     if args.cmd == "list":
@@ -1163,6 +1368,18 @@ def main():
             result["written_to"] = args.out
     elif args.cmd == "subscribe":
         result = subscribe_events(args.port, args.flags)
+    elif args.cmd == "upload-devices":
+        result = upload_devices_overrides(args.port, args.path, from_file=True)
+    elif args.cmd == "upload-persisted":
+        result = upload_persisted_data(args.port, args.path, from_file=True)
+    elif args.cmd == "upload-performance":
+        result = upload_performance(args.port, args.path, from_file=True)
+    elif args.cmd == "upload-lua-module":
+        result = upload_lua_module(args.port, args.namespace, args.name, args.path, from_file=True)
+    elif args.cmd == "clear-slot":
+        result = clear_preset_slot(args.port, args.bank, args.slot)
+    elif args.cmd == "remove-preset":
+        result = remove_preset(args.port, args.bank, args.slot)
     else:
         result = {"ok": False, "error": f"unknown cmd: {args.cmd}"}
 

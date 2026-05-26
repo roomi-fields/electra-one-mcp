@@ -381,6 +381,144 @@ def subscribe_events(flags: list[str],
 
 
 @mcp.tool()
+def upload_devices_overrides(devices_json_path: str,
+                              out_port: str = "MIDIOUT3 (Electra Controller)") -> dict[str, Any]:
+    """Upload devices.json (device routing overrides) to the active preset slot.
+
+    Devices.json lets you remap port/channel assignments without modifying the
+    preset itself. Useful for adapting a preset to a different MIDI setup.
+
+    SysEx: `F0 00 21 45 01 0F <devices-json> F7`.
+    """
+    if _is_wsl():
+        win_tmp = _windows_temp_dir()
+        if win_tmp is None:
+            return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+        # Copy local file to Windows-reachable temp
+        with open(devices_json_path, "rb") as src:
+            content = src.read()
+        dst = win_tmp / "electra-one-mcp" / "devices.json"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(content)
+        win_path = subprocess.run(
+            ["wslpath", "-w", str(dst)], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        return _run_bridge(["upload-devices", "--port", f'"{out_port}"', "--path", f'"{win_path}"'])
+    if _is_windows():
+        import win_bridge
+        return win_bridge.upload_devices_overrides(out_port, devices_json_path, from_file=True)
+    return {"ok": False, "error": "currently requires Windows (winmm bridge)"}
+
+
+@mcp.tool()
+def upload_persisted_data(data_json_path: str,
+                           out_port: str = "MIDIOUT3 (Electra Controller)") -> dict[str, Any]:
+    """Upload data.json (Lua persist() table) to the active preset slot.
+
+    SysEx: `F0 00 21 45 01 12 <data-json> F7`. Used to pre-populate runtime
+    state (e.g. last-known knob positions) before the user touches anything.
+    """
+    if _is_wsl():
+        win_tmp = _windows_temp_dir()
+        if win_tmp is None:
+            return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+        content = open(data_json_path, "rb").read()
+        dst = win_tmp / "electra-one-mcp" / "data.json"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(content)
+        win_path = subprocess.run(
+            ["wslpath", "-w", str(dst)], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        return _run_bridge(["upload-persisted", "--port", f'"{out_port}"', "--path", f'"{win_path}"'])
+    if _is_windows():
+        import win_bridge
+        return win_bridge.upload_persisted_data(out_port, data_json_path, from_file=True)
+    return {"ok": False, "error": "currently requires Windows (winmm bridge)"}
+
+
+@mcp.tool()
+def upload_performance(performance_json_path: str,
+                        out_port: str = "MIDIOUT3 (Electra Controller)") -> dict[str, Any]:
+    """Upload performance.json to the active preset slot.
+
+    A performance is a custom page made up of macros that reference existing
+    controls — lets you build a personalised playable view of a preset.
+
+    SysEx: `F0 00 21 45 01 11 <perf-json> F7`.
+    """
+    if _is_wsl():
+        win_tmp = _windows_temp_dir()
+        if win_tmp is None:
+            return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+        content = open(performance_json_path, "rb").read()
+        dst = win_tmp / "electra-one-mcp" / "performance.json"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(content)
+        win_path = subprocess.run(
+            ["wslpath", "-w", str(dst)], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        return _run_bridge(["upload-performance", "--port", f'"{out_port}"', "--path", f'"{win_path}"'])
+    if _is_windows():
+        import win_bridge
+        return win_bridge.upload_performance(out_port, performance_json_path, from_file=True)
+    return {"ok": False, "error": "currently requires Windows (winmm bridge)"}
+
+
+@mcp.tool()
+def upload_lua_module(lua_path: str, namespace: str, name: str,
+                       out_port: str = "MIDIOUT3 (Electra Controller)") -> dict[str, Any]:
+    """Upload a reusable Lua module to /ctrlv2/lua/<namespace>/<name>.lua.
+
+    Lua modules live OUTSIDE any preset slot; any slot's main.lua can
+    `require("<namespace>.<name>")` them. Useful for sharing helpers
+    across multiple widgets (e.g. our `Theme` and primitives).
+
+    Uses the File Transfer API (chunked) since modules can be large. The
+    namespace is usually your developer nickname.
+
+    Args:
+        lua_path: local file path to the .lua source.
+        namespace: folder name (developer nick) — e.g. "roomi".
+        name: module filename without `.lua` extension.
+    """
+    if _is_wsl():
+        win_tmp = _windows_temp_dir()
+        if win_tmp is None:
+            return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+        content = open(lua_path, "rb").read()
+        dst = win_tmp / "electra-one-mcp" / f"{name}.lua"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(content)
+        win_path = subprocess.run(
+            ["wslpath", "-w", str(dst)], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        return _run_bridge(["upload-lua-module", "--port", f'"{out_port}"',
+                            "--namespace", namespace, "--name", name,
+                            "--path", f'"{win_path}"'])
+    if _is_windows():
+        import win_bridge
+        return win_bridge.upload_lua_module(out_port, namespace, name, lua_path, from_file=True)
+    return {"ok": False, "error": "currently requires Windows (winmm bridge)"}
+
+
+@mcp.tool()
+def clear_preset_slot(bank: int, slot: int,
+                      out_port: str = "MIDIOUT3 (Electra Controller)") -> dict[str, Any]:
+    """Clear all files in a preset slot (preset.json, main.lua, devices.json, ...).
+
+    Useful when iterating a widget — gives you a clean slate to push to.
+    SysEx: `F0 00 21 45 05 08 <bank> <slot> F7`.
+    """
+    if _is_wsl():
+        return _run_bridge(["clear-slot", "--port", f'"{out_port}"',
+                            "--bank", str(bank), "--slot", str(slot)])
+    if _is_windows():
+        import win_bridge
+        return win_bridge.clear_preset_slot(out_port, bank, slot)
+    return {"ok": False, "error": "currently requires Windows (winmm bridge)"}
+
+
+@mcp.tool()
 def get_device_logs(seconds: float = 5.0, port: str | None = None) -> dict[str, Any]:
     """Listen on the CTRL port for `lua:` log messages from the device.
 
