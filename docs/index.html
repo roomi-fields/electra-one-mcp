@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>electra-one-mcp — Develop Electra One MK2/Mini widgets from Claude</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="electra-one-mcp is a Claude Code plugin for developing custom widgets and presets on the Electra One MK2/Mini MIDI controller. 20 MCP tools: push presets over USB SysEx, run an on-device Lua REPL, capture knob/button events, pull presets back into the repo. Ships the indexed official docs and 62 catalogued SysEx commands.">
+<meta name="keywords" content="MCP, MCP server, model context protocol, Electra One, Electra One MK2, Electra One Mini, MIDI controller, MIDI MCP, SysEx, Lua, Lua extension, preset development, widget development, hardware controller, embedded MCP, Claude, Claude Code, Anthropic, Electra One Lua, Electra One preset format, Electra One firmware">
+<meta name="robots" content="index, follow">
+<link rel="canonical" href="https://roomi-fields.github.io/electra-one-mcp/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="electra-one-mcp — Develop Electra One MK2/Mini widgets from Claude">
+<meta property="og:description" content="Claude Code plugin for the Electra One MK2/Mini MIDI controller. 20 MCP tools wrap the full dev loop: USB SysEx push, on-device Lua REPL, knob/button event capture, preset round-trip.">
+<meta property="og:url" content="https://roomi-fields.github.io/electra-one-mcp/">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="electra-one-mcp — Electra One widget development from Claude">
+<meta name="twitter:description" content="20 MCP tools for the Electra One MK2/Mini: USB SysEx push, on-device Lua REPL, preset round-trip, indexed official docs.">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "electra-one-mcp",
+  "description": "A Claude Code plugin for developing custom widgets and presets on the Electra One MK2/Mini MIDI controller. 20 MCP tools wrap the full dev loop: push presets over USB SysEx with auto-conversion (tiles to controls schema), live Lua REPL on the device, knob/button event capture, preset round-trip. Ships the indexed official docs and 62 catalogued SysEx commands.",
+  "applicationCategory": "DeveloperApplication",
+  "operatingSystem": "Windows, macOS, Linux",
+  "downloadUrl": "https://github.com/roomi-fields/electra-one-mcp",
+  "softwareVersion": "0.1.0",
+  "license": "https://opensource.org/licenses/MIT",
+  "author": { "@type": "Person", "name": "roomi-fields" },
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+  "keywords": "MCP, model context protocol, Electra One, Electra One MK2, Electra One Mini, MIDI controller, MIDI MCP, SysEx, Lua, preset development, widget development, embedded, hardware controller, Claude, Claude Code"
+}
+</script>
+<style>
+  :root { color-scheme: light dark; --fg: #222; --bg: #fafafa; --muted: #666;
+          --card: #fff; --border: #e0e0e0; --accent: #0969da; --code-bg: #f4f4f4; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg: #e6edf3; --bg: #0d1117; --muted: #8b949e;
+            --card: #161b22; --border: #30363d; --accent: #58a6ff; --code-bg: #1a1f29; }
+  }
+  * { box-sizing: border-box; }
+  body { font: 15px/1.6 -apple-system, system-ui, sans-serif;
+         color: var(--fg); background: var(--bg); margin: 0; padding: 24px; }
+  main, header, footer { max-width: 880px; margin: 0 auto; }
+  header { padding: 24px 0; border-bottom: 1px solid var(--border); margin-bottom: 32px; }
+  h1 { margin: 0 0 8px; font-size: 28px; }
+  h2 { margin: 32px 0 12px; font-size: 20px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+  h3 { margin: 24px 0 8px; font-size: 16px; }
+  .tagline { color: var(--muted); font-size: 16px; margin-bottom: 16px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+              background: var(--code-bg); border-radius: 4px; }
+  code { padding: 2px 6px; font-size: 13px; }
+  pre { padding: 12px 16px; overflow-x: auto; font-size: 13px;
+        border: 1px solid var(--border); }
+  pre code { background: transparent; padding: 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0;
+          background: var(--card); border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 14px; }
+  th { background: var(--bg); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  ul li { margin: 4px 0; }
+  .badges { margin: 12px 0; }
+  .badges img { vertical-align: middle; margin-right: 4px; }
+  footer { color: var(--muted); font-size: 13px; padding: 24px 0; margin-top: 48px;
+           border-top: 1px solid var(--border); text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>electra-one-mcp</h1>
+  <p class="tagline">A Claude Code plugin for developing custom widgets and presets on the <a href="https://electra.one">Electra One</a> MK2 / Mini MIDI controller.</p>
+  <div class="badges">
+    <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+    <a href="https://claude.ai/claude-code"><img src="https://img.shields.io/badge/Claude_Code-Plugin-8A2BE2" alt="Claude Code Plugin"></a>
+    <a href="https://github.com/roomi-fields/electra-one-mcp"><img src="https://img.shields.io/github/stars/roomi-fields/electra-one-mcp?style=social" alt="GitHub stars"></a>
+  </div>
+  <p>
+    <a href="https://github.com/roomi-fields/electra-one-mcp">Source on GitHub</a> ·
+    <a href="https://github.com/roomi-fields/electra-one-mcp/blob/main/docs/DEV_GUIDE.md">Dev guide</a> ·
+    <a href="https://github.com/roomi-fields/electra-one-mcp/blob/main/docs/RE_NOTES.md">Reverse-engineering notes</a> ·
+    <a href="https://github.com/roomi-fields/electra-one-mcp/blob/main/docs/FORUM_REFERENCES.md">Forum references</a>
+  </p>
+</header>
+
+<main>
+
+<h2>Install</h2>
+
+<p>Inside a Claude Code session:</p>
+
+<pre><code>/plugin marketplace add roomi-fields/claude-plugins
+/plugin install electra-one@roomi-fields</code></pre>
+
+<p>Then restart Claude Code so the MCP server registers. The <code>dev-electra-one</code> skill activates automatically as soon as you touch any Electra One Lua or preset file; the 20 MCP tools become available immediately.</p>
+
+<h2>What you get</h2>
+
+<ul>
+  <li><strong>20 MCP tools</strong> that wrap every common dev operation — push, inspect, REPL, pull, validate, search docs.</li>
+  <li><strong><code>dev-electra-one</code> skill</strong> auto-loaded as soon as you touch an Electra One file. Primes Claude with the device-side gotchas and the cheat sheet of all 20 tools.</li>
+  <li><strong>The full official docs mirrored locally</strong> (79 pages from <code>docs.electra.one</code>) plus a machine-readable distillation: <strong>180 Lua API symbols</strong>, 15 enum categories, <strong>17 device-side gotchas</strong>, <strong>62 SysEx commands</strong>, layout math for MK2 + Mini.</li>
+  <li><strong>A tiles ↔ controls schema converter</strong> ported byte-identical from <code>app.electra.one</code>'s JS bundle — push the repo-format widget JSONs straight to hardware without round-tripping through the web editor.</li>
+  <li><strong>Three written guides</strong>: a user-facing development walkthrough, reverse-engineering notes for the bundle ports, and a forum-references file with direct quotes from Electra staff explaining undocumented behaviour.</li>
+</ul>
+
+<h2>Why this exists</h2>
+
+<p>The Electra One Lua extension is powerful but its documentation is split across <code>docs.electra.one</code>, the forum (where most of the practical workarounds live as staff replies in support threads), and tribal knowledge. We lost hours rediscovering things like:</p>
+
+<ul>
+  <li><code>graphics.drawText</code> doesn't exist on device — use <code>graphics.print(x, y, text, w, align)</code>.</li>
+  <li>The <code>inputs</code> array in the preset JSON is silently ignored for <code>type:"custom"</code> tiles (firmware limit, forum #4172).</li>
+  <li><code>Reload Preset Slot</code> (<code>08 08</code>) NACKs on firmware 4.1.4 despite the docs listing it — you need a slot-flip workaround.</li>
+  <li>The widget JSONs in this repo are in a <code>tiles</code> schema the device firmware <em>doesn't parse</em> — the web editor converts to a <code>controls</code> schema before SysEx upload.</li>
+</ul>
+
+<p>This plugin packages those findings plus the official docs so future sessions don't repay the discovery tax. Every empirical claim ships with a source citation (forum thread, bundle offset, or hardware verification note).</p>
+
+<h2>Prerequisites</h2>
+
+<ul>
+  <li><strong>Python ≥ 3.10</strong> with the MCP SDK: <code>pip install -r requirements.txt</code></li>
+  <li><strong>An Electra One MK2 (or Mini)</strong> connected over USB MIDI.</li>
+  <li><strong>OS support</strong>:
+    <ul>
+      <li><strong>macOS</strong> — works out of the box via CoreMIDI + mido.</li>
+      <li><strong>Linux native</strong> — works out of the box via ALSA + mido.</li>
+      <li><strong>Windows native</strong> — works via the built-in <code>winmm.dll</code> (no driver install).</li>
+      <li><strong>WSL2</strong> — works <em>transparently</em> via a Python helper that runs on the Windows host. <strong>No <code>usbipd-win</code> required</strong>.</li>
+    </ul>
+  </li>
+</ul>
+
+<h2>The 20 MCP tools at a glance</h2>
+
+<table>
+  <thead><tr><th>Category</th><th>Tools</th></tr></thead>
+  <tbody>
+    <tr><td><strong>Push</strong> (JSON / Lua → device)</td><td><code>push_to_device</code>, <code>upload_devices_overrides</code>, <code>upload_persisted_data</code>, <code>upload_performance</code>, <code>upload_lua_module</code>, <code>clear_preset_slot</code></td></tr>
+    <tr><td><strong>Read</strong> (device state)</td><td><code>device_state</code>, <code>get_lua</code>, <code>get_preset</code>, <code>subscribe</code></td></tr>
+    <tr><td><strong>REPL</strong></td><td><code>execute_lua</code> (run Lua snippets on device, capture <code>print()</code> output)</td></tr>
+    <tr><td><strong>Pull</strong> (device → repo)</td><td><code>pull_preset</code> (downloads + runs reverse <code>controls→tiles</code> converter)</td></tr>
+    <tr><td><strong>Slot management</strong></td><td><code>switch_preset_slot</code>, <code>get_active_slot</code></td></tr>
+    <tr><td><strong>Docs &amp; reference</strong></td><td><code>search_docs</code>, <code>get_sysex_command</code>, <code>get_lua_api_symbol</code>, <code>get_gotchas</code></td></tr>
+    <tr><td><strong>Validation</strong></td><td><code>validate_preset_json</code>, <code>screenshot_widget</code></td></tr>
+  </tbody>
+</table>
+
+<p>See the <a href="https://github.com/roomi-fields/electra-one-mcp/blob/main/docs/DEV_GUIDE.md">Dev guide</a> for the full iteration loop and the per-tool reference.</p>
+
+<h2>Documentation</h2>
+
+<ul>
+  <li><a href="https://github.com/roomi-fields/electra-one-mcp/blob/main/docs/DEV_GUIDE.md"><strong>Dev guide</strong></a> — user-facing reference for the widget development loop, the 20 MCP tools, schema layers, and the typical iteration pattern.</li>
+  <li><a href="https://github.com/roomi-fields/electra-one-mcp/blob/main/docs/RE_NOTES.md"><strong>Reverse-engineering notes</strong></a> — how the tiles ↔ controls converter was ported from <code>app.electra.one</code>'s JS bundle, byte-identical, with offsets and verification notes.</li>
+  <li><a href="https://github.com/roomi-fields/electra-one-mcp/blob/main/docs/FORUM_REFERENCES.md"><strong>Forum references</strong></a> — direct quotes from Electra One staff (Martin, kris) on undocumented behaviour: file transfer limits, fragmentation, slot reload, custom tile constraints.</li>
+</ul>
+
+<h2>Where it fits</h2>
+
+<p>Part of the <a href="https://github.com/roomi-fields/claude-plugins"><code>roomi-fields/claude-plugins</code></a> marketplace alongside:</p>
+
+<ul>
+  <li><a href="https://roomi-fields.github.io/rtfm/"><strong>rtfm</strong></a> — the open retrieval layer for AI agents.</li>
+  <li><a href="https://github.com/roomi-fields/notebooklm-mcp"><strong>notebooklm</strong></a> — Google NotebookLM automation with citation-backed Q&amp;A.</li>
+  <li><a href="https://roomi-fields.github.io/osc-bridge/"><strong>osc-bridge</strong></a> — MIDI / OSC bridge for 849 synthesizers and DAWs (which includes Electra One MK2 as a first-class reconfigurable controller).</li>
+</ul>
+
+</main>
+
+<footer>
+  <a href="https://github.com/roomi-fields/electra-one-mcp">electra-one-mcp</a> ·
+  MIT License ·
+  Built by <a href="https://github.com/roomi-fields">roomi-fields</a>
+</footer>
+
+</body>
+</html>
