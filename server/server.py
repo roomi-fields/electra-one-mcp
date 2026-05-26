@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -544,13 +545,11 @@ def pull_preset(bank: int | None = None, slot: int | None = None,
     """
     # Step 1 — fetch preset JSON via Get Active Preset / Get Preset
     if _is_wsl():
-        # We don't have a CLI wrapper for raw "get preset" yet; use a custom
-        # SysEx via the existing send + listen pattern. Reuse get_lua's
-        # listener pattern by invoking listen_sysex around a manual send.
-        # Simplest path: write the request payload to %TEMP%, send, listen.
         win_tmp = _windows_temp_dir()
         if win_tmp is None:
             return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+
+        # Stage the Get Preset request bytes
         req = bytes([0xF0, 0x00, 0x21, 0x45, 0x02, 0x01])
         if bank is not None and slot is not None:
             req += bytes([bank & 0x7F, slot & 0x7F])
@@ -558,27 +557,49 @@ def pull_preset(bank: int | None = None, slot: int | None = None,
         req_path = win_tmp / "electra-one-mcp" / "get_preset.bin"
         req_path.parent.mkdir(parents=True, exist_ok=True)
         req_path.write_bytes(req)
+
+        # Resolve the bridge script path (staged earlier by _stage_bridge during
+        # the first MCP call; if not staged yet, do it now)
+        staged = _stage_bridge()
+        if staged is None:
+            return {"ok": False, "error": "could not stage win_bridge.py"}
+        _, win_bridge_path = staged
         win_req = subprocess.run(["wslpath", "-w", str(req_path)],
                                   capture_output=True, text=True, timeout=5).stdout.strip()
-        # Use a small helper: kick off listen on a background "job" via the
-        # bridge, then send. To keep it simple, do listen + send separately
-        # via the bridge's existing listen/send subcommands.
-        # Listen in background (PowerShell job), send, gather.
-        listen_cmd = (
-            f"$j = Start-Job -ScriptBlock {{ py -3.13 ${{env:TEMP}}\\electra-one-mcp\\win_bridge.py listen --port '{in_port}' --seconds 4 }};"
-            "Start-Sleep -Milliseconds 400;"
-            f"py -3.13 ${{env:TEMP}}\\electra-one-mcp\\win_bridge.py send --port '{out_port}' --payload '{win_req}' --chunk-size 32768 | Out-Null;"
-            "Wait-Job $j | Out-Null;"
-            "Receive-Job $j;"
-            "Remove-Job $j;"
+
+        # Launch a Python thread that runs `win_bridge listen` via subprocess,
+        # then call `win_bridge send` in the main flow, then join the listener.
+        # Cleaner than a PowerShell Start-Job dance.
+        import threading
+        result_box: dict[str, Any] = {}
+
+        def _listen_runner():
+            r = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command",
+                 f"py -3.13 '{win_bridge_path}' listen --port '{in_port}' --seconds 5"],
+                capture_output=True, text=True, timeout=12,
+            )
+            result_box["listen"] = r.stdout
+
+        t = threading.Thread(target=_listen_runner, daemon=True)
+        t.start()
+        time.sleep(0.6)
+
+        # Send the Get Preset request
+        send_result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"py -3.13 '{win_bridge_path}' send --port '{out_port}' --payload '{win_req}' --chunk-size 32768"],
+            capture_output=True, text=True, timeout=10,
         )
-        ps = subprocess.run(["powershell.exe", "-NoProfile", "-Command", listen_cmd],
-                             capture_output=True, text=True, timeout=15)
-        # Parse listener output
+        t.join(timeout=8)
+
         try:
-            listen_json = json.loads(ps.stdout.strip().splitlines()[-1])
-        except (json.JSONDecodeError, IndexError):
-            return {"ok": False, "error": "could not parse listen output", "raw": ps.stdout[:500]}
+            listen_json = json.loads(result_box.get("listen", "").strip().splitlines()[-1])
+        except (json.JSONDecodeError, IndexError, AttributeError):
+            return {"ok": False, "error": "could not parse listen output",
+                    "raw_listen": result_box.get("listen", "")[:500],
+                    "send_stdout": send_result.stdout[:300]}
+
         # Reassemble preset bytes from `01 01` responses
         preset_bytes = b""
         for m in listen_json.get("messages", []):
@@ -596,9 +617,12 @@ def pull_preset(bank: int | None = None, slot: int | None = None,
     except json.JSONDecodeError as e:
         return {"ok": False, "error": f"preset JSON parse failed: {e}", "raw": preset_bytes[:300].decode("utf-8", errors="replace")}
 
-    # Step 2 — fetch the Lua via get_lua_source (existing tool)
+    # Step 2 — fetch the Lua via get_lua_source (existing tool). Give the
+    # device a brief moment to drain the previous listener queue before we
+    # start a new one — back-to-back listen sessions race on the WSL path.
+    time.sleep(0.5)
     lua_result = get_lua_source(bank=bank, slot=slot, out_port=out_port,
-                                  in_port=in_port, listen_seconds=3.0)
+                                  in_port=in_port, listen_seconds=5.0)
     lua_text = lua_result.get("lua", "") if isinstance(lua_result, dict) else ""
 
     # Step 3 — reverse-convert to tiles schema
