@@ -1,14 +1,25 @@
 # electra-one-mcp
 
-An MCP server + Claude Code plugin for developing custom widgets and presets on the [Electra One](https://electra.one) MK2 / Mini MIDI controller, with three integrated parts:
+A Claude Code plugin for developing custom widgets and presets on the [Electra One](https://electra.one) MK2 / Mini MIDI controller. Push presets directly to hardware over USB, run a Lua REPL on the device for live inspection, capture knob/button events, pull the preset back into your repo, all without leaving Claude.
 
-1. **Skill `dev-electra-one`** — primes Claude with the verified Lua API + the device-side gotchas learned the hard way (graphics.print signature, integer coords, 1-pot-per-custom-tile firmware limit, IIFE-free bundling, etc.).
-2. **MCP server `electra-one`** — exposes nine tools so Claude can push presets, capture logs, search docs, validate, and bundle, all without you clicking around in `app.electra.one`.
-3. **Indexed docs** — the full official documentation mirror (79 pages, including the MIDI & Lua crash course) plus a machine-readable distillation (`docs/structured/api.json`, `constants.json`, `gotchas.json`).
+What you get when you install:
+
+- **20 MCP tools** that wrap every common EL1 dev operation — push, inspect, REPL, pull, validate, search docs.
+- **`dev-electra-one` skill** auto-loaded as soon as you touch an Electra One file. Primes Claude with the device-side gotchas + the cheat sheet of all 20 tools.
+- **The full official docs mirrored locally** (79 pages from `docs.electra.one`) + a machine-readable distillation (180 Lua API symbols, 15 enum categories, 17 device-side gotchas, 62 SysEx commands, layout math for MK2 + Mini).
+- **A tiles ↔ controls schema converter** ported byte-identical from `app.electra.one`'s JS bundle — push our repo-format widget JSONs straight to hardware without round-tripping through the web editor.
+- **Three written guides**: a user-facing development walkthrough, reverse-engineering notes for the bundle ports, and a forum-references file with direct quotes from Electra staff explaining undocumented behaviour.
 
 ## Why this exists
 
-The Electra One Lua extension is powerful but its documentation is split across `docs.electra.one`, the forum, and tribal knowledge. We've lost hours rediscovering things like "graphics.drawText doesn't exist on device, use graphics.print" or "the `inputs` array in the preset JSON is silently ignored for `type:"custom"` tiles". This plugin packages those findings + the official docs so future sessions don't repay the discovery tax.
+The Electra One Lua extension is powerful but its documentation is split across `docs.electra.one`, the forum (where most of the practical workarounds live as staff replies in support threads), and tribal knowledge. We lost hours rediscovering things like:
+
+- `graphics.drawText` doesn't exist on device — use `graphics.print(x, y, text, w, align)`.
+- The `inputs` array in the preset JSON is silently ignored for `type:"custom"` tiles (firmware limit, forum #4172).
+- `Reload Preset Slot` (`08 08`) NACKs on firmware 4.1.4 despite the docs listing it — you need a slot-flip workaround.
+- The widget JSONs in this repo are in a `tiles` schema the device firmware *doesn't parse* — the web editor converts to a `controls` schema before SysEx upload.
+
+This plugin packages those findings plus the official docs so future sessions don't repay the discovery tax. Every empirical claim ships with a source citation (forum thread, bundle offset, or hardware verification note).
 
 ## Install
 
@@ -19,98 +30,156 @@ Inside a Claude Code session:
 /plugin install electra-one@roomi-fields
 ```
 
-Then restart Claude Code so the MCP server is registered. The skill
-activates automatically as soon as you touch any Electra One Lua / preset
-code; the MCP tools become available under the `electra-one` namespace.
-
-Plug your Electra One in via USB before using the push / log / status
-tools, and make sure `sendmidi` is on your PATH (see "Prerequisites").
+Then restart Claude Code so the MCP server registers. The skill activates automatically as soon as you touch any Electra One Lua / preset code; the MCP tools become available immediately.
 
 ## Prerequisites
 
-- **Python ≥ 3.10** with the MCP SDK and MIDI deps:
+- **Python ≥ 3.10** with the MCP SDK:
 
   ```bash
   pip install -r requirements.txt
-  # or:
-  pip install mcp mido python-rtmidi
+  # or, on PEP 668 systems:
+  pip install --break-system-packages -r requirements.txt
   ```
 
-  On Debian/Ubuntu hosts that enforce PEP 668, use a venv or
-  `pip install --break-system-packages …`.
+  `python-rtmidi` and `mido` are pulled in for the native Linux/macOS path. On Windows / WSL the plugin uses a direct `winmm.dll` bridge instead, so rtmidi is optional there.
 
-- **A working MIDI backend** for python-rtmidi:
-  - **macOS** — CoreMIDI works out of the box, nothing to install.
-  - **Linux native** — ALSA is already there; the device is auto-detected.
-  - **WSL2** — same setup you'd use for `osc-bridge`: forward the USB
-    device with [`usbipd-win`](https://github.com/dorssel/usbipd-win)
-    (`usbipd attach --wsl --busid <n>`), and confirm `/dev/snd/seq`
-    exists in your WSL distro. If `osc-bridge list` shows the device,
-    so will this MCP.
-  - **Windows native** — WinMM works out of the box.
+- **An Electra One MK2 (or Mini)** connected over USB MIDI to your host. The plugin auto-targets the **CTRL port** (`MIDIOUT3 / MIDIIN3 (Electra Controller)` on Windows).
 
-- **Node ≥ 18** if you want to use the bundler / screenshot tools
-  (optional, only for the `screenshot_widget` tool).
+- **OS support**:
+  - **macOS** — works out of the box via CoreMIDI + mido.
+  - **Linux native** — works out of the box via ALSA + mido.
+  - **Windows native** — works via the built-in `winmm.dll` (no driver install).
+  - **WSL2** — works *transparently* via a Python helper that runs on the Windows host (`server/win_bridge.py`). The MCP shells out to `powershell.exe` to talk to `winmm.dll` on the Windows side. **No `usbipd-win` required**, no `/dev/snd/seq` setup, no extra drivers.
 
-## MCP tools exposed
+- **Node ≥ 18** — optional, only for `screenshot_widget` (headless emulator capture).
+
+## Quick start
+
+After install, push any widget JSON to the device:
+
+```
+push_to_device(preset_path="widgets/step-seq-16/demo.preset.json", bank=0, slot=0)
+```
+
+The plugin auto-detects the schema (tiles vs controls), runs the converter if needed, splits the inlined Lua into a separate upload, sends the 5-step pipeline (switch slot → upload preset → upload lua → slot-flip reload), and verifies every ACK along the way.
+
+To inspect what's happening on the device:
+
+```
+execute_lua("print(parameterMap.get(99))")
+device_state(seconds=2)
+```
+
+The first runs a Lua snippet on the device and captures `print()` output (REPL). The second listens for unsolicited events and returns the last-known bank/slot/page + recent activity.
+
+To pull a preset off the device back into the repo:
+
+```
+pull_preset(bank=0, slot=0, out_path="widgets/my-widget/demo.preset.json")
+```
+
+This downloads preset.json + main.lua, runs the reverse converter (`controls` → `tiles`), and writes a JSON ready to `git diff`.
+
+See `docs/DEV_GUIDE.md` for the full iteration loop and `docs/structured/sysex_commands.json` for every SysEx command available.
+
+## The 20 MCP tools
+
+Grouped by the dev need they cover:
+
+**Push** (move JSON / Lua onto the device)
 
 | Tool | What it does |
 |---|---|
-| `electra.push_to_device(preset_path)` | Encode the preset JSON as SysEx and send it to the active slot over USB MIDI **directly via mido + python-rtmidi** (no external binary). No browser, no clicks. |
-| `electra.get_device_logs(seconds)` | Listen on the CTRL port for `lua:` log messages from the device — print() output and fatal-error stack traces. Uses mido. |
-| `electra.device_status()` | Query firmware version, current preset name/slot, and connected MIDI port via SysEx info request. Uses mido. |
-| `electra.search_docs(query, kind)` | Full-text search of the mirrored documentation. `kind` filters by section (api / luacourse / troubleshooting / userguide). |
-| `electra.get_api(symbol)` | Return the documented signature + parameters + example for a specific Lua API symbol (`graphics.print`, `parameterMap.onChange`, etc.). |
-| `electra.list_constants(category)` | List enum constants by category — touch events (DOWN/MOVE/UP/CLICK/DOUBLECLICK), controller events, MIDI message types, alignments, models. |
-| `electra.validate_preset(json)` | Check a preset JSON against schema + known-bad patterns (drawText, IIFE wraps, bitwise at load time, etc.). Returns a list of warnings. |
-| `electra.bundle_widget(theme_path, primitives, widget_path)` | Concatenate theme + primitives + widget into a flat Lua blob suitable for the preset `lua` field. |
-| `electra.screenshot_widget(slug, url)` | Run a headless Playwright capture of the emulator rendering the widget. |
+| `push_to_device(preset_path, bank, slot)` | The headline tool. Auto-converts tiles→controls, splits Lua, runs the 5-step pipeline with ACK verification. |
+| `upload_devices_overrides(path)` | Upload devices.json (port/channel remap) — `01 0F` SysEx. |
+| `upload_persisted_data(path)` | Upload data.json (Lua `persist()` table) — `01 12`. |
+| `upload_performance(path)` | Upload performance.json (macro view) — `01 11`. |
+| `upload_lua_module(path, namespace, name)` | Upload a reusable Lua module to `/ctrlv2/lua/<ns>/<name>.lua` via the File Transfer API. |
+| `clear_preset_slot(bank, slot)` | Wipe all files in a slot — `05 08`. |
 
-## Repo layout
+**Read** (inspect what's running)
+
+| Tool | What it does |
+|---|---|
+| `execute_lua(source)` | Run a Lua snippet on the device WITHOUT saving it (REPL). Captures `print()` output. |
+| `device_state(seconds)` | Passive listen — returns last-known bank/slot/page/control-set + recent events + log lines. |
+| `get_lua_source(bank, slot)` | Download main.lua from a slot. |
+| `pull_preset(bank, slot, out_path)` | Combined: preset + lua + reverse-convert to tiles schema, write to disk. |
+| `subscribe_events(flags)` | Enable richer event delivery — pots, touch, button, window, etc. |
+| `device_status()` | Query firmware version + serial + model. |
+| `get_device_logs(seconds)` | Tail the device's log channel (legacy; `device_state` returns logs too). |
+
+**Compute** (offline / repo-side)
+
+| Tool | What it does |
+|---|---|
+| `bundle_widget(theme, primitives, widget)` | Concatenate theme + primitives + widget into one Lua blob. |
+| `validate_preset(json)` | Schema + known-bad-pattern check (drawText calls, IIFE wraps, etc.). |
+| `screenshot_widget(slug)` | Headless Playwright capture from the emulator. |
+
+**Doc lookup** (no device needed)
+
+| Tool | What it does |
+|---|---|
+| `search_docs(query, kind)` | Full-text search of the mirrored 79-page documentation. |
+| `get_api(symbol)` | Signature + params + example for a Lua API symbol (`graphics.print`, `parameterMap.onChange`, …). |
+| `list_constants(category)` | Enum constants by category — touch events, MIDI messages, alignments, models. |
+| `get_sysex_command(query)` | Look up any of the 62 catalogued SysEx commands by name or keyword. |
+
+## What's in the box
 
 ```
 electra-one-mcp/
 ├── .claude-plugin/plugin.json       # Claude Code manifest
 ├── skills/
-│   └── dev-electra-one/SKILL.md     # always-on Claude skill
+│   └── dev-electra-one/SKILL.md     # always-on Claude skill (auto-loads)
 ├── server/
-│   ├── server.py                    # MCP server — 20 tools
-│   ├── win_bridge.py                # winmm/ctypes bridge + CLI for raw EL1 operations
-│   ├── preset_converter.py          # tiles↔controls schema converter (ported from app.electra.one)
+│   ├── server.py                    # 20 MCP tools
+│   ├── win_bridge.py                # winmm/ctypes bridge + CLI (Linux/macOS/Windows/WSL)
+│   ├── preset_converter.py          # tiles ↔ controls schema converter (ported from app.electra.one)
 │   └── __init__.py / __main__.py
 ├── docs/
-│   ├── DEV_GUIDE.md                 # user-facing widget-development guide
+│   ├── DEV_GUIDE.md                 # user-facing widget-development guide ★ READ FIRST
 │   ├── RE_NOTES.md                  # reverse-engineering notes (bundle offsets, function ports)
-│   ├── FORUM_REFERENCES.md          # quotes from Martin/kris explaining undocumented behaviour
-│   ├── md/                          # raw markdown mirror of docs.electra.one (79 pages)
+│   ├── FORUM_REFERENCES.md          # staff quotes for undocumented behaviour
+│   ├── md/                          # 79-page mirror of docs.electra.one
 │   └── structured/
-│       ├── api.json                 # 180 Lua API symbols → signature/params/returns/example
-│       ├── constants.json           # all enum constants grouped by category (15 categories)
-│       ├── gotchas.json             # device-side quirks confirmed empirically (17 entries)
-│       ├── sysex_commands.json      # 62 SysEx commands (host→device + events) with bytes + payload
-│       └── layout_constants.json    # MK2 + Mini layout dimensions + slot-bounds formulas
+│       ├── api.json                 # 180 Lua API symbols
+│       ├── constants.json           # 15 enum categories
+│       ├── gotchas.json             # 17 empirically-confirmed device-side quirks
+│       ├── sysex_commands.json      # 62 SysEx commands + events
+│       └── layout_constants.json    # MK2 + Mini layout math
 ├── scripts/
 │   ├── refresh-docs.sh              # re-scrape docs.electra.one
-│   └── build-structured.py          # generate docs/structured/*.json from docs/md
+│   └── build-structured.py          # regenerate docs/structured/*.json
 └── examples/
-    ├── push-and-watch.md            # tutorial: push + capture logs in one go
-    └── overlay-recipe.md            # tutorial: customize a step list via overlay JSON
+    ├── push-and-watch.md
+    └── overlay-recipe.md
 ```
 
-## Docs to read in order
+## Recommended reading order
 
-1. **`docs/DEV_GUIDE.md`** — user-facing dev guide: the iteration loop, all 20 MCP tools, troubleshooting.
-2. **`docs/md/developers/luaext.md`** — official Lua extension API (the surface you call from a preset's `main.lua`).
+1. **`docs/DEV_GUIDE.md`** — the iteration loop, all 20 MCP tools, troubleshooting playbook.
+2. **`docs/md/developers/luaext.md`** — official Lua extension API.
 3. **`docs/md/developers/midiimplementation.md`** + **`docs/md/developers/filetransfer.md`** — official SysEx protocol.
 4. **`docs/structured/sysex_commands.json`** — queryable catalog of 62 SysEx commands.
-5. **`docs/RE_NOTES.md`** — what we reverse-engineered from `app.electra.one` and why (read this before modifying `preset_converter.py`).
-6. **`docs/FORUM_REFERENCES.md`** — staff quotes for the undocumented behaviour (file transfer limits, schema mismatches, slot reload NACKs).
+5. **`docs/RE_NOTES.md`** — what we reverse-engineered from `app.electra.one`. Read this before modifying `preset_converter.py`.
+6. **`docs/FORUM_REFERENCES.md`** — staff quotes for the undocumented behaviour.
+
+## Known limitations
+
+- **File Transfer API + `type:"preset"`** silently rolls back on commit for firmware 4.1.4. We default to the simple `01 01` + `01 0C` path instead (what the web editor uses). The FT API is exposed in `mode="ft"` for completeness + for Lua module uploads where it's the only path.
+- **`08 08 Reload Preset Slot`** NACKs on firmware 4.1.4. The plugin uses a slot-flip workaround automatically.
+- **No SysEx query for "current bank/slot"** — the device only emits unsolicited `7E 02 bank slot` events on user navigation. `device_state` tracks these client-side.
+- **Windows USB-MIDI fragmentation** above ~5 KB single-SysEx — known since the late-2025 Windows updates KB5077181 / KB5074105. We work around by keeping `01 01` payloads small (< 1 KB after extracting Lua) and chunk-aware where needed. Long-term: port to Windows MIDI Services 1.0 (Win 11 24H2+).
+- **MIDI capture / playback** + **snapshot write/move/swap** SysEx commands are documented in `sysex_commands.json` but not yet wrapped as MCP tools. Use `get_sysex_command(...)` to look up bytes if you need them.
 
 ## Acknowledgements
 
 - Electra One team (Martin Pavlas, Thomas Moravansky) for the hardware and the publicly-documented Lua API.
-- Forum threads #4172, #4116, #4185, #592, #410, #2370, #2022, #807, #3590 for the staff quotes and confirmations that made this plugin possible.
-- `xot/ElectraOne` (Codeberg), `johnnyclem/electra-one` and `elliotwoods/simularca-electra-one-plugin` as reference open-source consumers of the SysEx protocol.
+- Forum threads #592, #410, #2370, #2022, #807, #3590, #4172, #4116, #4185, #4058, #4259 for the staff quotes and confirmations that made this plugin possible — see `docs/FORUM_REFERENCES.md` for direct quotes and links.
+- `xot/ElectraOne` (Codeberg), `johnnyclem/electra-one`, `elliotwoods/simularca-electra-one-plugin` as reference open-source consumers of the SysEx protocol.
 
 ## License
 
