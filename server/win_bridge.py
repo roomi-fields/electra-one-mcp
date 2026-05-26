@@ -768,6 +768,295 @@ def listen_sysex(port_name: str, seconds: float) -> dict:
     }
 
 
+# --- Phase C: read-side helpers (device_state, execute_lua, get_lua_source, subscribe_events) ---
+#
+# All four are thin wrappers over the existing send/listen scaffolding.
+# They classify the 7E XX event vocabulary catalogued in
+# docs/structured/sysex_commands.json (the editor bundle's event handlers
+# crossreferenced with docs.electra.one).
+
+# Mapping 7E event code → friendly name. Source: docs.electra.one event table.
+_EVENT_NAMES = {
+    0x00: "nack",          # F0 00 21 45 7E 00 <txid-lsb> <txid-msb> F7
+    0x01: "ack",           # F0 00 21 45 7E 01 <txid-lsb> <txid-msb> F7
+    0x02: "preset_switch", # F0 00 21 45 7E 02 <bank> <slot> F7
+    0x03: "snapshot_list_change",
+    0x04: "snapshot_bank_switch",
+    0x05: "preset_list_change",
+    0x06: "page_switch",
+    0x07: "control_set_switch",
+    0x08: "preset_bank_switch",
+    0x0A: "pot_touch",     # F0 00 21 45 7E 0A <pot> <ctrl-lsb> <ctrl-msb> <touched> F7
+    0x2D: "transfer_progress",
+    0x31: "capture_list_change",
+}
+
+
+def _classify_sysex_event(raw: bytes) -> dict:
+    """Classify a SysEx the device sent us. Returns a structured event dict.
+
+    Recognises ACK/NACK (`7E 01/00`), navigation events (`7E 02/06/07/08`),
+    pot touches (`7E 0A`), file-transfer progress (`7E 2D`), preset/snapshot/
+    capture list-change notifications (`7E 03/05/31`), and log messages
+    (`7F 00 …text…`)."""
+    if len(raw) < 6 or raw[0] != 0xF0 or raw[-1] != 0xF7:
+        return {"kind": "unknown", "hex": raw.hex()}
+    if raw[1:4] != bytes([0x00, 0x21, 0x45]):
+        return {"kind": "non-electra-sysex", "hex": raw.hex()}
+    op = raw[4]
+    if op == 0x7E and len(raw) >= 7:
+        code = raw[5]
+        name = _EVENT_NAMES.get(code, f"event_7E_{code:02x}")
+        result = {"kind": "event", "name": name, "code": code, "hex": raw.hex()}
+        # decode known payloads
+        if code in (0x01, 0x00):  # ack/nack
+            if len(raw) >= 9:
+                result["txid"] = raw[6] | (raw[7] << 7)
+        elif code == 0x02 and len(raw) >= 9:  # preset switch
+            result["bank"] = raw[6]; result["slot"] = raw[7]
+        elif code in (0x04, 0x06, 0x07, 0x08) and len(raw) >= 8:
+            result["value"] = raw[6]  # bank / page / set / bank
+        elif code == 0x0A and len(raw) >= 11:  # pot touch
+            result["pot"] = raw[6]
+            result["control_id"] = raw[7] | (raw[8] << 7)
+            result["touched"] = bool(raw[9])
+        elif code == 0x2D and len(raw) >= 11:  # transfer progress
+            s = raw[6] | (raw[7] << 7) | (raw[8] << 14) | (raw[9] << 21)
+            result["bytes_transferred"] = s
+        return result
+    if op == 0x7F and raw[5] == 0x00:  # log message
+        # F0 00 21 45 7F 00 <ts(?)> <ascii-text> F7
+        text = raw[6:-1].decode("utf-8", errors="replace").lstrip("\x00\x01\x02\x03")
+        return {"kind": "log", "text": text, "hex": raw.hex()}
+    if op == 0x01:  # command response (data reply)
+        resource = raw[5]
+        body = raw[6:-1].decode("utf-8", errors="replace")
+        return {"kind": "response", "resource": resource, "body": body[:2000], "hex": raw.hex()[:200]}
+    return {"kind": "other_op", "op": op, "hex": raw.hex()}
+
+
+def device_state(in_port: str, seconds: float = 2.0) -> dict:
+    """Passively listen on the CTRL input for `seconds` and return what we
+    learned about the device's current state.
+
+    Decodes ACK/NACK, preset_switch, page_switch, control_set_switch,
+    bank_switch, pot_touch, list_change notifications, and log messages.
+    Tracks the "last known value" per navigation category so the caller has
+    something like a snapshot of the device's current UI focus.
+    """
+    raw_listen = listen_sysex(in_port, seconds)
+    if not raw_listen.get("ok"):
+        return raw_listen
+
+    events = []
+    log = []
+    state = {"bank": None, "slot": None, "page": None, "control_set": None, "snapshot_bank": None}
+    for m in raw_listen["messages"]:
+        ev = _classify_sysex_event(bytes.fromhex(m["hex"]))
+        if ev["kind"] == "event":
+            events.append(ev)
+            if ev["name"] == "preset_switch":
+                state["bank"] = ev.get("bank"); state["slot"] = ev.get("slot")
+            elif ev["name"] == "preset_bank_switch":
+                state["bank"] = ev.get("value")
+            elif ev["name"] == "page_switch":
+                state["page"] = ev.get("value")
+            elif ev["name"] == "control_set_switch":
+                state["control_set"] = ev.get("value")
+            elif ev["name"] == "snapshot_bank_switch":
+                state["snapshot_bank"] = ev.get("value")
+        elif ev["kind"] == "log":
+            log.append(ev["text"])
+        else:
+            events.append(ev)
+
+    short = raw_listen.get("short_messages", [])
+    return {
+        "ok": True,
+        "seconds": seconds,
+        "port": raw_listen["port"],
+        "state": state,
+        "events": events,
+        "log": log[:200],
+        "short_midi": short,  # raw CC/note bytes from physical knob/button presses
+    }
+
+
+def execute_lua(out_port: str, source: str, in_port: str | None = None,
+                listen_seconds: float = 2.0) -> dict:
+    """Run a Lua snippet on the device WITHOUT saving it (REPL-style).
+
+    Uses `08 0D Execute Lua` (the non-persistent variant — `01 0C` saves
+    to main.lua). The MCP launches a listener BEFORE sending so it can
+    capture any `7F 00` log lines the snippet produces, then waits
+    `listen_seconds` after sending to give the device time to run.
+
+    Use cases:
+    - inspection: `print(parameterMap.get(99))`, `print(controls.get(1):getName())`
+    - state nudging: `parameterMap.set(1, PT_VIRTUAL, 99, 64)` then watch
+      paint behaviour
+    - testing: try a Lua expression before committing it to widget.lua
+
+    Args:
+        source: ASCII Lua source. Non-ASCII bytes are stripped — print
+                them as numeric escapes if you need them.
+        listen_seconds: how long to listen for log output after sending.
+                        2 s is usually enough for short snippets; raise
+                        for snippets that schedule timers.
+    """
+    import threading
+
+    if in_port is None:
+        in_port = out_port.replace("MIDIOUT", "MIDIIN")
+        if in_port == out_port:
+            in_port = "MIDIIN3 (Electra Controller)"
+
+    # Strip non-ASCII (em-dash etc.) and frame the SysEx
+    ascii_src = source.encode("ascii", errors="ignore")
+    if not ascii_src:
+        return {"ok": False, "error": "empty Lua source (or only non-ASCII)"}
+    blob = bytes([0xF0, 0x00, 0x21, 0x45, 0x08, 0x0D]) + ascii_src + bytes([0xF7])
+
+    # Launch listener in a thread BEFORE we send
+    listen_seconds_total = max(0.2, listen_seconds) + 0.4  # arm + drain
+    result_box: dict = {}
+    def _runner():
+        result_box["data"] = listen_sysex(in_port, listen_seconds_total)
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    time.sleep(0.2)  # let listener arm itself
+
+    # Send the Execute Lua SysEx
+    ports = list_ports()
+    out_idx = _resolve_port(out_port, ports["outputs"])
+    if out_idx is None:
+        return {"ok": False, "error": f"output port not found: {out_port!r}"}
+    handle = c_void_p()
+    rc = winmm.midiOutOpen(byref(handle), out_idx, None, None, 0)
+    if rc != 0:
+        return {"ok": False, "error": f"midiOutOpen rc={rc}"}
+    try:
+        rc = _send_one_chunk(handle, blob)
+    finally:
+        winmm.midiOutClose(handle)
+    if rc != 0:
+        return {"ok": False, "error": f"send rc={rc}"}
+
+    t.join(timeout=listen_seconds_total + 1.0)
+    listener = result_box.get("data", {"messages": []})
+
+    output_lines = []
+    ack = None
+    for m in listener.get("messages", []):
+        ev = _classify_sysex_event(bytes.fromhex(m["hex"]))
+        if ev["kind"] == "log":
+            output_lines.append(ev["text"])
+        elif ev["kind"] == "event" and ev["name"] in ("ack", "nack"):
+            ack = ev["name"]
+
+    return {
+        "ok": ack != "nack",
+        "ack": ack,
+        "output": output_lines,
+        "sent_bytes": len(blob),
+    }
+
+
+def get_lua_source(out_port: str, bank: int | None = None, slot: int | None = None,
+                   in_port: str | None = None, listen_seconds: float = 3.0) -> dict:
+    """Fetch main.lua from the active slot (or a specific bank/slot) via `02 0C`.
+
+    Returns the raw Lua source text. Useful for pulling a preset's current
+    Lua off the device before editing locally.
+    """
+    if in_port is None:
+        in_port = out_port.replace("MIDIOUT", "MIDIIN")
+        if in_port == out_port:
+            in_port = "MIDIIN3 (Electra Controller)"
+
+    body = bytes([0x02, 0x0C])
+    if bank is not None and slot is not None:
+        body += bytes([bank & 0x7F, slot & 0x7F])
+    blob = bytes([0xF0, 0x00, 0x21, 0x45]) + body + bytes([0xF7])
+
+    # Run listener in parallel
+    import threading
+    result_box: dict = {}
+    def _runner():
+        result_box["data"] = listen_sysex(in_port, listen_seconds + 0.4)
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    time.sleep(0.2)
+
+    ports = list_ports()
+    out_idx = _resolve_port(out_port, ports["outputs"])
+    if out_idx is None:
+        return {"ok": False, "error": f"output port not found: {out_port!r}"}
+    handle = c_void_p()
+    rc = winmm.midiOutOpen(byref(handle), out_idx, None, None, 0)
+    if rc != 0:
+        return {"ok": False, "error": f"midiOutOpen rc={rc}"}
+    try:
+        rc = _send_one_chunk(handle, blob)
+    finally:
+        winmm.midiOutClose(handle)
+    if rc != 0:
+        return {"ok": False, "error": f"send rc={rc}"}
+
+    t.join(timeout=listen_seconds + 1.0)
+    listener = result_box.get("data", {"messages": []})
+
+    lua_text = ""
+    for m in listener.get("messages", []):
+        raw = bytes.fromhex(m["hex"])
+        if len(raw) > 6 and raw[1:5] == bytes([0x00, 0x21, 0x45, 0x01]) and raw[5] == 0x0C:
+            lua_text += raw[6:-1].decode("utf-8", errors="replace")
+
+    return {"ok": bool(lua_text), "bank": bank, "slot": slot, "lua": lua_text, "length": len(lua_text)}
+
+
+_EVENT_FLAGS = {
+    "page": 0x01, "controlset": 0x02, "usb": 0x04, "pots": 0x08,
+    "touch": 0x10, "button": 0x20, "window": 0x40,
+}
+
+
+def subscribe_events(out_port: str, flags: list[str]) -> dict:
+    """Subscribe to additional event categories (`14 79 <bitmask>`).
+
+    By default the device emits preset_switch, bank_switch, page_switch,
+    list_change events, and pot_touch unsolicited. Other event categories
+    (button presses on side hardware buttons, window events, full-screen
+    touchscreen events, USB host events) need to be explicitly subscribed.
+
+    flags: any of `page`, `controlset`, `usb`, `pots`, `touch`, `button`, `window`.
+    """
+    mask = 0
+    for f in flags:
+        bit = _EVENT_FLAGS.get(f.lower())
+        if bit is None:
+            return {"ok": False, "error": f"unknown flag: {f!r}", "valid": list(_EVENT_FLAGS.keys())}
+        mask |= bit
+
+    blob = bytes([0xF0, 0x00, 0x21, 0x45, 0x14, 0x79, mask & 0x7F, 0xF7])
+    ports = list_ports()
+    out_idx = _resolve_port(out_port, ports["outputs"])
+    if out_idx is None:
+        return {"ok": False, "error": f"output port not found: {out_port!r}"}
+    handle = c_void_p()
+    rc = winmm.midiOutOpen(byref(handle), out_idx, None, None, 0)
+    if rc != 0:
+        return {"ok": False, "error": f"midiOutOpen rc={rc}"}
+    try:
+        rc = _send_one_chunk(handle, blob)
+    finally:
+        winmm.midiOutClose(handle)
+    if rc != 0:
+        return {"ok": False, "error": f"send rc={rc}"}
+
+    return {"ok": True, "flags": flags, "mask_hex": f"{mask:02x}", "sent_bytes": len(blob)}
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -792,6 +1081,31 @@ def main():
                     help="simple = 01 01 + 01 0C (the path the working CLIs use); "
                          "ft = File Transfer cache (open/register/chunks/commit). "
                          "default 'simple' per sourced research (forum #592, johnnyclem, elliotwoods).")
+
+    # Phase C subcommands — read capabilities
+    ds = sub.add_parser("device-state", help="passive listen + classify EL1 events (current bank/slot/page/etc.)")
+    ds.add_argument("--port", required=True, help="CTRL IN port (e.g. 'MIDIIN3 (Electra Controller)')")
+    ds.add_argument("--seconds", type=float, default=2.0)
+
+    el = sub.add_parser("execute-lua", help="run a Lua snippet on device WITHOUT saving (REPL)")
+    el.add_argument("--port", required=True, help="CTRL OUT port (e.g. 'MIDIOUT3 (Electra Controller)')")
+    el.add_argument("--in-port", default=None)
+    el.add_argument("--source", required=True, help="Lua source (single line) OR path to .lua file")
+    el.add_argument("--from-file", action="store_true", help="treat --source as a file path")
+    el.add_argument("--seconds", type=float, default=2.0, help="how long to wait for print() output")
+
+    gls = sub.add_parser("get-lua", help="fetch main.lua from active or specified slot")
+    gls.add_argument("--port", required=True)
+    gls.add_argument("--in-port", default=None)
+    gls.add_argument("--bank", type=int, default=None)
+    gls.add_argument("--slot", type=int, default=None)
+    gls.add_argument("--seconds", type=float, default=3.0)
+    gls.add_argument("--out", default=None, help="if set, write the Lua to this path")
+
+    se = sub.add_parser("subscribe", help="subscribe to additional event categories (14 79)")
+    se.add_argument("--port", required=True)
+    se.add_argument("--flags", nargs="+", required=True,
+                    help="any of: page controlset usb pots touch button window")
 
     args = ap.parse_args()
 
@@ -835,6 +1149,20 @@ def main():
                 use_tx_id=not args.no_tx_id,
                 lua_bytes=lua_bytes,
             )
+    elif args.cmd == "device-state":
+        result = device_state(args.port, seconds=args.seconds)
+    elif args.cmd == "execute-lua":
+        src = open(args.source, encoding="utf-8").read() if args.from_file else args.source
+        result = execute_lua(args.port, src, in_port=args.in_port, listen_seconds=args.seconds)
+    elif args.cmd == "get-lua":
+        result = get_lua_source(args.port, bank=args.bank, slot=args.slot,
+                                in_port=args.in_port, listen_seconds=args.seconds)
+        if result.get("ok") and args.out:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(result.get("lua", ""))
+            result["written_to"] = args.out
+    elif args.cmd == "subscribe":
+        result = subscribe_events(args.port, args.flags)
     else:
         result = {"ok": False, "error": f"unknown cmd: {args.cmd}"}
 

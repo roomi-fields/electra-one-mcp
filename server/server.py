@@ -255,6 +255,132 @@ def push_to_device(preset_path: str, port: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
+def device_state(seconds: float = 2.0, in_port: str = "MIDIIN3 (Electra Controller)") -> dict[str, Any]:
+    """Passively listen on the CTRL input for `seconds`, return the device's current UI state.
+
+    Decodes the 7E XX event vocabulary the device emits unsolicited:
+    preset_switch (`7E 02 bank slot`), bank_switch (`7E 08 bank`),
+    page_switch (`7E 06 page`), control_set_switch (`7E 07 set`),
+    pot_touch (`7E 0A pot ctrl-id touched`), and the various list_change
+    notifications. Also captures `7F 00` log messages (print() output and
+    runtime Lua errors).
+
+    Returns a dict with `state` (last known values per nav category),
+    `events` (chronological), `log` (text lines from device), and
+    `short_midi` (raw CC/note bytes from physical knob/button motion).
+
+    Args:
+        seconds: how long to listen.
+        in_port: CTRL input port name on the host.
+    """
+    if _is_wsl():
+        return _run_bridge(["device-state", "--port", f'"{in_port}"', "--seconds", str(seconds)])
+    if _is_windows():
+        import win_bridge
+        return win_bridge.device_state(in_port, seconds=seconds)
+    return {"ok": False, "error": "device_state currently requires Windows (winmm bridge) — Linux/macOS native path TBD"}
+
+
+@mcp.tool()
+def execute_lua(source: str, out_port: str = "MIDIOUT3 (Electra Controller)",
+                in_port: str = "MIDIIN3 (Electra Controller)",
+                listen_seconds: float = 2.0) -> dict[str, Any]:
+    """Run a Lua snippet on the device WITHOUT saving it (REPL-style).
+
+    Uses `08 0D Execute Lua` (the non-persistent variant — different from
+    `01 0C` which writes main.lua). Captures any `print()` output emitted
+    by the snippet via `7F 00` log messages, plus the ACK/NACK response.
+
+    Use cases:
+    - `print(parameterMap.get(99))` — inspect a virtual param value
+    - `print(controls.get(1):getName())` — read control properties
+    - `parameterMap.set(1, PT_VIRTUAL, 99, 64)` — nudge state from outside
+
+    The snippet runs in the device's Lua sandbox with full access to the
+    runtime API (parameterMap, controls, devices, controller, etc.).
+
+    Args:
+        source: ASCII Lua source. Non-ASCII chars are stripped.
+        out_port / in_port: CTRL ports on the host.
+        listen_seconds: how long to wait for print() output (raise for
+                        snippets that schedule timers / callbacks).
+    """
+    if _is_wsl():
+        # Write the source to a Windows-reachable temp file
+        win_tmp = _windows_temp_dir()
+        if win_tmp is None:
+            return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+        src_path = win_tmp / "electra-one-mcp" / "repl.lua"
+        src_path.parent.mkdir(parents=True, exist_ok=True)
+        src_path.write_text(source, encoding="utf-8")
+        win_path = subprocess.run(
+            ["wslpath", "-w", str(src_path)], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        return _run_bridge([
+            "execute-lua", "--port", f'"{out_port}"', "--in-port", f'"{in_port}"',
+            "--source", f'"{win_path}"', "--from-file",
+            "--seconds", str(listen_seconds),
+        ])
+    if _is_windows():
+        import win_bridge
+        return win_bridge.execute_lua(out_port, source, in_port=in_port, listen_seconds=listen_seconds)
+    return {"ok": False, "error": "execute_lua currently requires Windows (winmm bridge)"}
+
+
+@mcp.tool()
+def get_lua_source(bank: int | None = None, slot: int | None = None,
+                   out_port: str = "MIDIOUT3 (Electra Controller)",
+                   in_port: str = "MIDIIN3 (Electra Controller)",
+                   listen_seconds: float = 3.0) -> dict[str, Any]:
+    """Download main.lua from the device.
+
+    Sends `02 0C [bank] [slot]` and accumulates the response. With no
+    bank/slot, fetches the currently-active slot's Lua. Useful for
+    pulling a preset's Lua off the device after editing it on-device,
+    or for verifying what was actually written by upload_preset.
+
+    Returns `{ok, bank, slot, lua, length}`.
+    """
+    args = ["get-lua", "--port", f'"{out_port}"', "--in-port", f'"{in_port}"',
+            "--seconds", str(listen_seconds)]
+    if bank is not None:
+        args += ["--bank", str(bank)]
+    if slot is not None:
+        args += ["--slot", str(slot)]
+
+    if _is_wsl():
+        return _run_bridge(args)
+    if _is_windows():
+        import win_bridge
+        return win_bridge.get_lua_source(out_port, bank=bank, slot=slot,
+                                          in_port=in_port, listen_seconds=listen_seconds)
+    return {"ok": False, "error": "get_lua_source currently requires Windows (winmm bridge)"}
+
+
+@mcp.tool()
+def subscribe_events(flags: list[str],
+                     out_port: str = "MIDIOUT3 (Electra Controller)") -> dict[str, Any]:
+    """Subscribe to additional event categories the device should emit unsolicited.
+
+    Sends `14 79 <bitmask>` with the bits for the requested categories.
+    By default the device only emits preset/bank/page switch events and
+    pot touches. Other events (physical button presses on the side
+    hardware buttons, full-screen touchscreen events, window events,
+    USB host events) require explicit subscription.
+
+    Args:
+        flags: any of `page`, `controlset`, `usb`, `pots`, `touch`,
+               `button`, `window`. Use device_state afterwards to capture.
+    """
+    if _is_wsl():
+        return _run_bridge(["subscribe", "--port", f'"{out_port}"', "--flags"] + flags)
+    if _is_windows():
+        import win_bridge
+        return win_bridge.subscribe_events(out_port, flags)
+    return {"ok": False, "error": "subscribe_events currently requires Windows (winmm bridge)"}
+
+
+@mcp.tool()
 def get_device_logs(seconds: float = 5.0, port: str | None = None) -> dict[str, Any]:
     """Listen on the CTRL port for `lua:` log messages from the device.
 
