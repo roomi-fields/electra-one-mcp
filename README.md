@@ -74,15 +74,21 @@ electra-one-mcp/
 ├── skills/
 │   └── dev-electra-one/SKILL.md     # always-on Claude skill
 ├── server/
-│   ├── __init__.py
-│   ├── __main__.py                  # python -m server (rarely used directly)
-│   └── server.py                    # MCP server using the official `mcp` SDK
+│   ├── server.py                    # MCP server — 20 tools
+│   ├── win_bridge.py                # winmm/ctypes bridge + CLI for raw EL1 operations
+│   ├── preset_converter.py          # tiles↔controls schema converter (ported from app.electra.one)
+│   └── __init__.py / __main__.py
 ├── docs/
+│   ├── DEV_GUIDE.md                 # user-facing widget-development guide
+│   ├── RE_NOTES.md                  # reverse-engineering notes (bundle offsets, function ports)
+│   ├── FORUM_REFERENCES.md          # quotes from Martin/kris explaining undocumented behaviour
 │   ├── md/                          # raw markdown mirror of docs.electra.one (79 pages)
 │   └── structured/
-│       ├── api.json                 # Lua API symbols → signature/params/returns/example
-│       ├── constants.json           # all enum constants grouped by category
-│       └── gotchas.json             # device-side quirks confirmed empirically
+│       ├── api.json                 # 180 Lua API symbols → signature/params/returns/example
+│       ├── constants.json           # all enum constants grouped by category (15 categories)
+│       ├── gotchas.json             # device-side quirks confirmed empirically (17 entries)
+│       ├── sysex_commands.json      # 62 SysEx commands (host→device + events) with bytes + payload
+│       └── layout_constants.json    # MK2 + Mini layout dimensions + slot-bounds formulas
 ├── scripts/
 │   ├── refresh-docs.sh              # re-scrape docs.electra.one
 │   └── build-structured.py          # generate docs/structured/*.json from docs/md
@@ -91,10 +97,20 @@ electra-one-mcp/
     └── overlay-recipe.md            # tutorial: customize a step list via overlay JSON
 ```
 
+## Docs to read in order
+
+1. **`docs/DEV_GUIDE.md`** — user-facing dev guide: the iteration loop, all 20 MCP tools, troubleshooting.
+2. **`docs/md/developers/luaext.md`** — official Lua extension API (the surface you call from a preset's `main.lua`).
+3. **`docs/md/developers/midiimplementation.md`** + **`docs/md/developers/filetransfer.md`** — official SysEx protocol.
+4. **`docs/structured/sysex_commands.json`** — queryable catalog of 62 SysEx commands.
+5. **`docs/RE_NOTES.md`** — what we reverse-engineered from `app.electra.one` and why (read this before modifying `preset_converter.py`).
+6. **`docs/FORUM_REFERENCES.md`** — staff quotes for the undocumented behaviour (file transfer limits, schema mismatches, slot reload NACKs).
+
 ## Acknowledgements
 
 - Electra One team (Martin Pavlas, Thomas Moravansky) for the hardware and the publicly-documented Lua API.
-- Forum threads #4172, #4116, #4185 for confirming the firmware limits we hit in practice.
+- Forum threads #4172, #4116, #4185, #592, #410, #2370, #2022, #807, #3590 for the staff quotes and confirmations that made this plugin possible.
+- `xot/ElectraOne` (Codeberg), `johnnyclem/electra-one` and `elliotwoods/simularca-electra-one-plugin` as reference open-source consumers of the SysEx protocol.
 
 ## License
 

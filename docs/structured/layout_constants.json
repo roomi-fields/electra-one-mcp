@@ -1,0 +1,80 @@
+{
+  "_meta": {
+    "source": "Extracted from app.electra.one bundle 0c61af0.js around offset 129500 (setLayoutDefaults).",
+    "verified": "Output matches a live MIDI sniff of the web editor uploading step-seq-16 (slotId=1 → bounds=[181,6,158,16], potId=8).",
+    "research_date": "2026-05-26"
+  },
+
+  "mk2": {
+    "id": "mk2-6x6",
+    "displayName": "Electra One Mk2 6x6",
+    "displayWidth": 1024,
+    "displayHeight": 565,
+    "grid": { "cols": 6, "rows": 12, "slotsPerPage": 72 },
+    "pages": { "numPages": 12, "pageIds": [1,2,3,4,5,6,7,8,9,10,11,12] },
+    "section": { "slotsInSection": 24, "controlsInSection": 12 },
+    "slot_dimensions": {
+      "controlWidth": 168, "controlHeight": 60,
+      "groupWidth": 168, "groupHeight": 30,
+      "groupSpanHeight": 97
+    },
+    "rowY_px": [0, 30, 90, 120, 180, 210, 270, 300, 360, 390, 450, 480],
+    "maxVspan": 6,
+    "rows_alternate": "even y = label/group row (h=30), odd y = control row (h=60)",
+    "formulas": {
+      "slotIdToX": "slotId % 6",
+      "slotIdToY": "Math.floor((slotId % 72) / 6)",
+      "slotIdToPageId": "Math.floor(slotId / 72) + 1",
+      "slotIdToBounds_label": "x = 20 + 167*col - 6; y_px = 6 + 22*(row/2 + row%2) + 68*(row//2); w = 146*span + 21*(span-1) + 12; h = vspan>0 ? 90*vspan - 9 : 16",
+      "slotIdToBounds_control": "x = 20 + 167*col; y_px = same; w = 146; h = 56",
+      "slotIdToPot": "x = slotId%6; (slotId//6) %% 4 == 1 ? x + 1 : x + 7",
+      "slotIdToSet": "(slotId//6) % 12 // 4 + 1",
+      "boundsToSlotId": "col = bounds[0] // 170; 72*(pageId-1) + 6*(2*((bounds[1]-6)//90) + ((bounds[1]-6) % 90 == 0 ? 0 : 1)) + col"
+    }
+  },
+
+  "mini": {
+    "id": "mini-4x2",
+    "displayName": "Electra One Mini 4x2",
+    "displayWidth": 800,
+    "displayHeight": 440,
+    "grid": { "cols": 4, "rows": 6, "slotsPerPage": 24 },
+    "pages": { "numPages": 8, "pageIds": [1,2,3,4,5,6,7,8] },
+    "section": { "slotsInSection": 24, "controlsInSection": 12 },
+    "slot_dimensions": {
+      "controlWidth": 194, "controlHeight": 125,
+      "groupWidth": 195, "groupHeight": 30,
+      "groupSpanHeight": 175
+    },
+    "rowY_px": [0, 30, 170, 200, 340, 370],
+    "maxVspan": 2,
+    "rows_alternate": "rows 0-3 are 'small' (group above each control); rows 4-5 are 'large' (compact)",
+    "formulas": {
+      "slotIdToX": "slotId % 4",
+      "slotIdToY": "Math.floor((slotId % 24) / 4)",
+      "slotIdToPageId": "Math.floor(slotId / 24) + 1",
+      "slotIdToPot": "x = slotId%4; x + 4*((y-1)//2) + 1"
+    }
+  },
+
+  "examples": [
+    {
+      "device": "mk2",
+      "input": { "slotId": 1, "span": null, "vspan": null },
+      "expected_output": { "x": 181, "y": 6, "width": 158, "height": 16, "potId": 8, "controlSetId": 1, "pageId": 1 },
+      "note": "Top-row, second-column label slot. Verified byte-identical to web editor output."
+    },
+    {
+      "device": "mk2",
+      "input": { "slotId": 6, "span": null, "vspan": null },
+      "expected_output": { "x": 20, "y": 28, "width": 146, "height": 56, "potId": 7, "controlSetId": 1, "pageId": 1 },
+      "note": "First control row, leftmost column."
+    },
+    {
+      "device": "mk2",
+      "input": { "slotId": 7, "span": 6, "vspan": 0 },
+      "expected_output": { "x": 181, "y": 28, "width": 998, "height": 56 },
+      "note": "Full-width spanned control row (span=6 columns)."
+    }
+  ]
+}
