@@ -377,6 +377,33 @@ small complete SysEx so the driver doesn't fragment:
 
 **Reference impl + ongoing state**: `server/win_bridge.py` in [electra-one-mcp](https://github.com/roomi-fields/electra-one-mcp). See `HOWTO.md` section "Pushing presets via SysEx" for the full play-by-play and forum thread #592.
 
+**Major root-cause discovery (2026-05-26): preset schema mismatch.**
+
+The widget files in `electraone-widgets/widgets/*/demo.preset.json` use a
+"new" schema that the **device firmware does not parse via direct SysEx**:
+`schemaVersion`, `tiles`, `targetDevice`, `firstPageId`, `categoryId` per
+tile — none of these appear in [presetformat.html](https://docs.electra.one/developers/presetformat.html). The documented schema uses `version` (numeric), `pages`,
+`devices`, `overlays`, `groups`, `controls` (no `tiles`).
+
+The web editor at `app.electra.one` converts our "tiles" schema to the
+documented "controls" schema before sending the SysEx. Pushing the raw
+"tiles"-format JSON via `01 01` (or via the FT API with `type:"preset"`)
+**ACKs successfully at the transport level but the on-device preset parser
+silently rejects the structure** — `Get Active Preset` (`02 01`) afterwards
+returns 0 bytes, and the screen shows "no name - page 1" or stays empty.
+
+This explains every "silent rollback" we've observed for big presets — it
+was never a size/MD5/chunking issue, it was always a schema mismatch.
+
+To push to the device without going through the website, you need to either:
+- Convert tiles → controls/groups before upload (and route the inlined `lua`
+  field to a separate `01 0C` upload, per docs)
+- Or sniff what app.electra.one actually sends (`navigator.requestMIDIAccess`
+  → wrap `MIDIOutput.send`) and replicate that exact byte sequence
+
+The MCP `push_to_device` in v0.x assumes the documented "controls" schema.
+For "tiles"-schema presets, you must convert first or upload via the web app.
+
 **Empirical limits confirmed on firmware 4.1.4 (2026-05-26)**:
 - < ~5 KB via simple `01 01` upload: works, displays immediately
 - < ~6 KB via FT API: commit succeeds, file persists, displays after reload trigger

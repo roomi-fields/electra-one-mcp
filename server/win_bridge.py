@@ -198,6 +198,181 @@ def send_sysex(port_name: str, payload_path: str, chunk_size: int = 256) -> dict
     }
 
 
+def upload_preset_simple(
+    out_port: str,
+    preset_json_bytes: bytes,
+    lua_bytes: bytes | None,
+    bank: int = 0,
+    slot: int = 0,
+    in_port: str | None = None,
+    ack_timeout: float = 3.0,
+) -> dict:
+    """Upload a preset via the SIMPLE (documented & widely-used) path.
+
+    This is the codepath both shipping CLIs use (johnnyclem/electra-one,
+    elliotwoods/simularca-electra-one-plugin). The File Transfer cache API
+    is documented for firmware / lua-modules / multi-file atomic deploys —
+    NOT for preset+lua uploads, where it silently rolls back commits.
+
+    Flow per docs.electra.one + forum thread #592 + the two reference impls:
+      1. Switch Preset Slot: F0 00 21 45 09 08 bank slot F7   → ACK
+      2. Upload Preset:      F0 00 21 45 01 01 <ascii-json> F7  → ACK
+      3. Upload Lua Script:  F0 00 21 45 01 0C <ascii-lua> F7   → ACK (if lua present)
+      4. Reload Preset Slot: F0 00 21 45 08 08 F7              → ACK
+      5. caller can Get Active Preset (02 01) to verify
+
+    Caveat: steps 2 & 3 each send the file as a SINGLE SysEx. On Windows the
+    USB-MIDI 1.0 class driver fragments SysEx >~5 KB, so this works for
+    presets/lua under that ceiling. For larger lua, callers should fall back
+    to upload_lua_file_transfer (single-file FT with type:"lua").
+    """
+    import threading
+
+    if in_port is None:
+        in_port = out_port.replace("MIDIOUT", "MIDIIN")
+        if in_port == out_port:
+            in_port = "MIDIIN3 (Electra Controller)"
+
+    pending: dict[int, dict] = {}
+    pending_lock = threading.Lock()
+    listener_stop = threading.Event()
+
+    def _ack_listener():
+        ports = list_ports()
+        idx = _resolve_port(in_port, ports["inputs"])
+        if idx is None:
+            return
+        CALLBACK_FUNCTION = 0x00030000
+        MIM_LONGDATA = 0x3C4
+        CallbackProto = ctypes.WINFUNCTYPE(None, c_void_p, c_uint, c_void_p, c_void_p, c_void_p)
+        BUF_SIZE = 8192
+        NUM_BUFS = 4
+        headers = [MIDIHDR() for _ in range(NUM_BUFS)]
+        buffers = [ctypes.create_string_buffer(BUF_SIZE) for _ in range(NUM_BUFS)]
+        handle_l = c_void_p()
+
+        def _arm(i):
+            hdr = headers[i]
+            hdr.lpData = ctypes.cast(buffers[i], ctypes.c_char_p)
+            hdr.dwBufferLength = BUF_SIZE
+            hdr.dwBytesRecorded = 0
+            hdr.dwFlags = 0
+            winmm.midiInPrepareHeader(handle_l, byref(hdr), sizeof(hdr))
+            winmm.midiInAddBuffer(handle_l, byref(hdr), sizeof(hdr))
+
+        def _cb(hMidi, wMsg, dwInst, dwP1, dwP2):
+            if wMsg != MIM_LONGDATA or not dwP1:
+                return
+            hdr_ptr = ctypes.cast(dwP1, POINTER(MIDIHDR))
+            hdr = hdr_ptr.contents
+            n = hdr.dwBytesRecorded
+            if n <= 0:
+                return
+            for i in range(NUM_BUFS):
+                if ctypes.addressof(headers[i]) == ctypes.addressof(hdr):
+                    raw = bytes(buffers[i].raw[:n])
+                    # Parse ACK/NACK with optional txid
+                    if len(raw) >= 7 and raw[1:5] == bytes([0x00, 0x21, 0x45, 0x7E]):
+                        ok = raw[5] == 0x01
+                        if len(raw) >= 9:
+                            txid = raw[6] | (raw[7] << 7)
+                        else:
+                            txid = 0
+                        with pending_lock:
+                            pending[txid] = {"ok": ok, "raw": raw}
+                    winmm.midiInUnprepareHeader(hMidi, hdr_ptr, sizeof(MIDIHDR))
+                    _arm(i)
+                    return
+
+        cb = CallbackProto(_cb)
+        rc = winmm.midiInOpen(byref(handle_l), idx, ctypes.cast(cb, c_void_p), None, CALLBACK_FUNCTION)
+        if rc != 0:
+            return
+        try:
+            for i in range(NUM_BUFS):
+                _arm(i)
+            winmm.midiInStart(handle_l)
+            while not listener_stop.wait(0.02):
+                pass
+            winmm.midiInStop(handle_l)
+            for hdr in headers:
+                winmm.midiInUnprepareHeader(handle_l, byref(hdr), sizeof(hdr))
+        finally:
+            winmm.midiInClose(handle_l)
+
+    listener_thread = threading.Thread(target=_ack_listener, daemon=True)
+    listener_thread.start()
+    time.sleep(0.1)
+
+    _tx = [0]
+
+    def _next_tx():
+        _tx[0] = (_tx[0] + 1) & 0x3FFF
+        return _tx[0]
+
+    def _send_and_wait(cmd_body: bytes, step: str) -> dict:
+        txid = _next_tx()
+        lsb = txid & 0x7F
+        msb = (txid >> 7) & 0x7F
+        blob = bytes([0xF0, 0x00, 0x21, 0x45, 0x00, lsb, msb]) + cmd_body + bytes([0xF7])
+        ports = list_ports()
+        idx = _resolve_port(out_port, ports["outputs"])
+        if idx is None:
+            return {"ok": False, "step": step, "error": "out port not found"}
+        handle = c_void_p()
+        rc = winmm.midiOutOpen(byref(handle), idx, None, None, 0)
+        if rc != 0:
+            return {"ok": False, "step": step, "rc": rc, "error": "midiOutOpen"}
+        try:
+            rc = _send_one_chunk(handle, blob)
+        finally:
+            winmm.midiOutClose(handle)
+        if rc != 0:
+            return {"ok": False, "step": step, "rc": rc}
+        deadline = time.monotonic() + ack_timeout
+        while time.monotonic() < deadline:
+            with pending_lock:
+                if txid in pending:
+                    r = pending.pop(txid)
+                    return {"ok": r["ok"], "step": step, "txid": txid, "ack_hex": r["raw"].hex(),
+                            "sent_bytes": len(blob)}
+            time.sleep(0.005)
+        return {"ok": False, "step": step, "txid": txid, "error": "ACK timeout",
+                "sent_bytes": len(blob)}
+
+    try:
+        # 1. Switch slot
+        r = _send_and_wait(bytes([0x09, 0x08, bank & 0x7F, slot & 0x7F]), "switch_slot")
+        if not r["ok"]:
+            return r
+
+        # 2. Upload Preset (preset.json, no lua field)
+        r = _send_and_wait(bytes([0x01, 0x01]) + preset_json_bytes, "upload_preset")
+        if not r["ok"]:
+            return r
+
+        # 3. Upload Lua (if present and small enough). Caller should pre-check
+        # size and use FT API for the lua if needed.
+        if lua_bytes is not None and len(lua_bytes) > 0:
+            r = _send_and_wait(bytes([0x01, 0x0C]) + lua_bytes, "upload_lua")
+            if not r["ok"]:
+                return r
+
+        # 4. Reload Preset Slot
+        r = _send_and_wait(bytes([0x08, 0x08]), "reload_slot")
+        # Don't fail on reload NACK — file is already written.
+
+        return {
+            "ok": True, "via": "simple-01-01-and-01-0c",
+            "bank": bank, "slot": slot,
+            "preset_size": len(preset_json_bytes),
+            "lua_size": len(lua_bytes) if lua_bytes else 0,
+        }
+    finally:
+        listener_stop.set()
+        listener_thread.join(timeout=2.0)
+
+
 def upload_preset_file_transfer(
     out_port: str,
     preset_json_bytes: bytes,
@@ -208,6 +383,7 @@ def upload_preset_file_transfer(
     verify_ack: bool = True,
     ack_timeout: float = 3.0,
     use_tx_id: bool = True,
+    lua_bytes: bytes | None = None,
 ) -> dict:
     """Upload a preset using Electra's File Transfer SysEx API.
 
@@ -227,6 +403,12 @@ def upload_preset_file_transfer(
     """
     import hashlib, json as _json, threading
 
+    # Build list of files to register/transfer
+    files_to_send = [(1, "preset", preset_json_bytes, hashlib.md5(preset_json_bytes).hexdigest())]
+    if lua_bytes is not None:
+        files_to_send.append((2, "lua", lua_bytes, hashlib.md5(lua_bytes).hexdigest()))
+
+    # backward-compat for diag fields
     file_id = 1
     size = len(preset_json_bytes)
     md5 = hashlib.md5(preset_json_bytes).hexdigest()
@@ -386,43 +568,46 @@ def upload_preset_file_transfer(
         if not r["ok"]:
             return r
 
-        # 2. Register file (size as four 7-bit, LE)
-        s0 = size & 0x7F
-        s1 = (size >> 7) & 0x7F
-        s2 = (size >> 14) & 0x7F
-        s3 = (size >> 21) & 0x7F
-        r = _send_and_wait(
-            bytes([0x01, 0x2E, file_id, s0, s1, s2, s3]),
-            "register",
-        )
-        step_log.append(r)
-        if not r["ok"]:
-            return r
-
-        # 3. Send chunks
-        chunks_sent = 0
-        for offset in range(0, size, chunk_bytes):
-            chunk = preset_json_bytes[offset:offset + chunk_bytes]
-            if any(b >= 0x80 for b in chunk):
-                return {"ok": False, "step": "chunk", "error": "non-7bit byte"}
-            cmd = bytes([0x01, 0x2F, file_id]) + chunk
-            r = _send_and_wait(cmd, f"chunk_{chunks_sent}")
+        # 2. Register all files (one Register command per file)
+        for fid, ftype, fbytes, fmd5 in files_to_send:
+            fsize = len(fbytes)
+            s0 = fsize & 0x7F
+            s1 = (fsize >> 7) & 0x7F
+            s2 = (fsize >> 14) & 0x7F
+            s3 = (fsize >> 21) & 0x7F
+            r = _send_and_wait(
+                bytes([0x01, 0x2E, fid, s0, s1, s2, s3]),
+                f"register_{ftype}",
+            )
+            step_log.append(r)
             if not r["ok"]:
-                r["chunk_index"] = chunks_sent
                 return r
-            chunks_sent += 1
-            # The device's USB-MIDI receive buffer can overflow if we blast all
-            # chunks back-to-back. The 6.2 KB / 25-chunk preset goes through
-            # fine, but 25 KB / 99 chunks fails to persist — most likely the
-            # device's parser falls behind and the commit rolls back silently.
-            # Empirical: a small inter-chunk gap fixes uploads >~ 8 KB.
-            time.sleep(0.01)
 
-        # 4. Commit
-        commit = {"files": [{
-            "id": file_id, "location": "slots", "type": "preset",
-            "bankNumber": bank, "slot": slot, "md5": md5,
-        }]}
+        # 3. Send chunks for each file (interleave them per file id)
+        chunks_sent = 0
+        for fid, ftype, fbytes, fmd5 in files_to_send:
+            fsize = len(fbytes)
+            for offset in range(0, fsize, chunk_bytes):
+                chunk = fbytes[offset:offset + chunk_bytes]
+                if any(b >= 0x80 for b in chunk):
+                    return {"ok": False, "step": "chunk", "error": "non-7bit byte", "file": ftype, "offset": offset}
+                cmd = bytes([0x01, 0x2F, fid]) + chunk
+                r = _send_and_wait(cmd, f"chunk_{ftype}_{chunks_sent}")
+                if not r["ok"]:
+                    r["chunk_index"] = chunks_sent
+                    r["file"] = ftype
+                    return r
+                chunks_sent += 1
+                time.sleep(0.01)
+
+        # 4. Commit — one entry per file
+        files_list = []
+        for fid, ftype, fbytes, fmd5 in files_to_send:
+            files_list.append({
+                "id": fid, "location": "slots", "type": ftype,
+                "bankNumber": bank, "slot": slot, "md5": fmd5,
+            })
+        commit = {"files": files_list}
         commit_json = _json.dumps(commit, separators=(",", ":")).encode("utf-8")
         r = _send_and_wait(bytes([0x04, 0x2D]) + commit_json, "commit")
         step_log.append(r)
@@ -596,6 +781,10 @@ def main():
     up.add_argument("--chunk-bytes", type=int, default=1024)
     up.add_argument("--no-verify-ack", action="store_true")
     up.add_argument("--no-tx-id", action="store_true", help="skip transaction id wrapping (legacy firmware compat)")
+    up.add_argument("--mode", choices=["simple", "ft"], default="simple",
+                    help="simple = 01 01 + 01 0C (the path the working CLIs use); "
+                         "ft = File Transfer cache (open/register/chunks/commit). "
+                         "default 'simple' per sourced research (forum #592, johnnyclem, elliotwoods).")
 
     args = ap.parse_args()
 
@@ -609,14 +798,32 @@ def main():
     elif args.cmd == "upload-preset":
         with open(args.preset, "rb") as f:
             preset_bytes = f.read()
-        # No JSON roundtrip — send raw bytes. Minifying changes the byte layout
-        # which makes the on-device MD5 verification mismatch (or so we suspect).
-        result = upload_preset_file_transfer(
-            args.port, preset_bytes,
-            bank=args.bank, slot=args.slot, chunk_bytes=args.chunk_bytes,
-            verify_ack=not args.no_verify_ack,
-            use_tx_id=not args.no_tx_id,
-        )
+        # Strip inline "lua" field — it must ride a separate upload per docs
+        # (luaext.html, midiimplementation.html). The preset's JSON schema has
+        # no "lua" field; the device parser silently discards it.
+        lua_bytes = None
+        try:
+            obj = json.loads(preset_bytes)
+            lua_content = obj.pop("lua", "")
+            if isinstance(lua_content, str) and lua_content.strip():
+                lua_bytes = lua_content.encode("ascii", errors="ignore")
+            preset_bytes = json.dumps(obj, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+        except (json.JSONDecodeError, UnicodeEncodeError):
+            pass
+
+        if args.mode == "simple":
+            result = upload_preset_simple(
+                args.port, preset_bytes, lua_bytes,
+                bank=args.bank, slot=args.slot,
+            )
+        else:
+            result = upload_preset_file_transfer(
+                args.port, preset_bytes,
+                bank=args.bank, slot=args.slot, chunk_bytes=args.chunk_bytes,
+                verify_ack=not args.no_verify_ack,
+                use_tx_id=not args.no_tx_id,
+                lua_bytes=lua_bytes,
+            )
     else:
         result = {"ok": False, "error": f"unknown cmd: {args.cmd}"}
 
