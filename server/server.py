@@ -148,7 +148,11 @@ def _run_bridge(args: list[str]) -> dict[str, Any]:
     if staged is None:
         return {"ok": False, "error": "could not stage win_bridge.py to %TEMP% (not WSL?)"}
     _, win_path = staged
-    cmd = ["powershell.exe", "-NoProfile", "-Command", f"python '{win_path}' " + " ".join(args)]
+    # IMPORTANT: use `py -3.13` not `python` — on hosts with multiple
+    # Pythons installed, `python` may resolve to a version where
+    # python-rtmidi crashes on import (we observed this on Python 3.14
+    # on the test host). Python 3.13 has known-good rtmidi wheels.
+    cmd = ["powershell.exe", "-NoProfile", "-Command", f"py -3.13 '{win_path}' " + " ".join(args)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     except subprocess.TimeoutExpired:
@@ -178,81 +182,83 @@ def _send_via_windows(sysex_payload: bytes, port_name: str) -> dict[str, Any]:
 # ---------- tools ----------
 
 @mcp.tool()
-def push_to_device(preset_path: str, port: str | None = None) -> dict[str, Any]:
-    """Upload a preset JSON to the Electra One's currently selected slot via USB SysEx.
+def push_to_device(preset_path: str, bank: int = 0, slot: int = 0,
+                   out_port: str = "MIDIOUT3 (Electra Controller)") -> dict[str, Any]:
+    """Upload a widget preset to the Electra One, end-to-end.
 
-    Sends `F0 00 21 45 01 01 <preset-json-bytes> F7` directly through the OS
-    MIDI stack. On native Linux/macOS/Windows this uses mido + python-rtmidi.
-    On WSL it routes through a tiny Windows-side helper (win_bridge.py) that
-    talks to winmm.dll via ctypes — no usbipd-win setup required as long as
-    the device is connected to the Windows host.
+    Reads the preset JSON, auto-detects whether it's in the repo's "tiles"
+    schema (`schemaVersion`, `tiles[]`) or the device firmware's "controls"
+    schema (`version`, `controls[]`). For "tiles" presets, converts to the
+    "controls" format via the byte-identical port of `projectToPreset` from
+    app.electra.one's JS bundle. Splits the `lua` field into a separate
+    main.lua upload. Sends:
 
-    The preset upload SysEx must reach the CTRL port, which on Windows surfaces
-    as `MIDIOUT3 (Electra Controller)`. We auto-target that name in WSL mode.
+      1. `09 08 bank slot` — switch to target slot
+      2. `01 01 <preset.json>` — upload preset
+      3. `01 0C <main.lua>` — upload Lua (if present)
+      4. Slot-flip reload — `09 08 bank (slot XOR 1)` then back — forces
+         the device to cold-reload from disk (`08 08 Reload Preset Slot`
+         NACKs on firmware 4.1.4).
+
+    Each step waits for ACK on the CTRL input; NACK aborts.
 
     Args:
-        preset_path: Filesystem path to the preset.json (or demo.preset.json).
-        port: Optional MIDI output port name; auto-detected (matches "electra") if omitted.
+        preset_path: filesystem path to the preset .json (tiles or controls schema)
+        bank: target preset bank (0–5, default 0)
+        slot: target slot within the bank (0–11, default 0)
+        out_port: CTRL output port on the host (default MIDIOUT3)
     """
     p = Path(preset_path)
     if not p.exists():
         return {"ok": False, "error": f"preset not found: {preset_path}"}
 
-    preset_json = p.read_text(encoding="utf-8")
-    minified = json.dumps(json.loads(preset_json), separators=(",", ":"))
-    payload_data = [0x00, 0x21, 0x45, 0x01, 0x01] + list(minified.encode("utf-8"))
+    project = json.loads(p.read_text(encoding="utf-8"))
 
-    sysex_blob = bytes([0xF0] + payload_data + [0xF7])
+    # Auto-detect schema, run through the converter if needed
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from preset_converter import split_preset_for_upload
+    is_tiles = "tiles" in project or "schemaVersion" in project
+    if is_tiles:
+        target = project.get("targetDevice", "mk2")
+        preset_bytes, lua_bytes = split_preset_for_upload(project, target_device=target)
+    else:
+        # Already controls schema — strip lua, minify
+        lua_raw = project.pop("lua", "")
+        lua_bytes = lua_raw.encode("ascii", errors="ignore") if (lua_raw and lua_raw.strip()) else None
+        preset_bytes = json.dumps(project, separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
-    # Windows-native path: call win_bridge functions directly (in-process, no IPC)
+    # WSL path — shell out to the bridge's `upload-preset` subcommand (which
+    # does the full switch → 01 01 → 01 0C → slot-flip pipeline)
+    if _is_wsl():
+        win_tmp = _windows_temp_dir()
+        if win_tmp is None:
+            return {"ok": False, "error": "could not resolve Windows %TEMP%"}
+        # Reconstruct a project dict the bridge can consume directly:
+        # the bridge's upload-preset auto-detects schema, so we pass the
+        # original tiles project (or the already-controls one).
+        proj_to_send = project if not is_tiles else json.loads(p.read_text(encoding="utf-8"))
+        dst = win_tmp / "electra-one-mcp" / "to_push.preset.json"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(json.dumps(proj_to_send), encoding="utf-8")
+        win_path = subprocess.run(
+            ["wslpath", "-w", str(dst)], capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        return _run_bridge([
+            "upload-preset", "--port", f'"{out_port}"', "--preset", f'"{win_path}"',
+            "--bank", str(bank), "--slot", str(slot), "--mode", "simple",
+        ])
+
+    # Windows-native path — call win_bridge.upload_preset_simple in-process
     if _is_windows():
         import win_bridge
-        target = port or "MIDIOUT3 (Electra Controller)"
-        # Write to a temp file and call send_sysex (it reads from disk)
-        import tempfile
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as f:
-            f.write(sysex_blob)
-            tmp = f.name
-        try:
-            result = win_bridge.send_sysex(target, tmp, chunk_size=32768)
-        finally:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-        result.setdefault("via", "windows winmm (in-process)")
-        result["bytes_sent"] = len(sysex_blob)
-        return result
+        return win_bridge.upload_preset_simple(
+            out_port, preset_bytes, lua_bytes,
+            bank=bank, slot=slot,
+        )
 
-    # WSL path: shell out to win_bridge on Windows
-    if _is_wsl():
-        target = port or "MIDIOUT3 (Electra Controller)"
-        result = _send_via_windows(sysex_blob, target)
-        result.setdefault("via", "wsl→windows winmm")
-        result.setdefault("port", target)
-        result["bytes_sent"] = len(sysex_blob)
-        return result
-
-    # Native path (Linux/macOS/Windows): mido + python-rtmidi
-    m = _get_mido()
-    if m is None:
-        return {"ok": False, "error": "install python-mido and python-rtmidi: pip install mido python-rtmidi"}
-
-    target = port or _find_electra_port("output")
-    if not target:
-        try:
-            available = m.get_output_names()
-        except Exception as e:
-            return {"ok": False, "error": _MIDI_BACKEND_HINT + f"  raw error: {e}"}
-        return {"ok": False, "error": "no Electra MIDI port found", "available_ports": available}
-
-    try:
-        with m.open_output(target) as out:
-            out.send(m.Message("sysex", data=payload_data))
-    except Exception as e:
-        return {"ok": False, "error": f"send failed: {e}"}
-
-    return {"ok": True, "port": target, "bytes_sent": len(payload_data) + 2}
+    return {"ok": False,
+            "error": "push_to_device currently requires Windows or WSL (winmm bridge). "
+                     "Linux/macOS native path TBD — use mido + python-rtmidi for the simple `01 01` upload as a fallback."}
 
 
 @mcp.tool()
